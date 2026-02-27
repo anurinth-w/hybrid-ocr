@@ -1,4 +1,3 @@
-
 import os, json, time, socket
 from pathlib import Path
 
@@ -19,14 +18,44 @@ ddb = session.client("dynamodb")
 def now_ms() -> int:
     return int(time.time() * 1000)
 
-def ddb_set_status(job_id: str, new_status: str, *, only_if_status: str | None = None, extra: dict | None = None):
+def claim_job(job_id: str) -> bool:
+    """
+    Atomic job claim:
+    Only one worker can transition QUEUED -> PROCESSING.
+    """
+    t = now_ms()
+    try:
+        ddb.update_item(
+            TableName=DDB_TABLE,
+            Key={"job_id": {"S": job_id}},
+            UpdateExpression="SET #s=:p, worker_id=:w, processing_started_at=:t, updated_at=:t",
+            ConditionExpression="#s = :q",
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={
+                ":q": {"S": "QUEUED"},
+                ":p": {"S": "PROCESSING"},
+                ":w": {"S": WORKER_ID},
+                ":t": {"N": str(t)},
+            },
+        )
+        return True
+    except ClientError as e:
+        code = e.response.get("Error", {}).get("Code", "")
+        if code == "ConditionalCheckFailedException":
+            return False
+        raise
+
+def ddb_set_status(job_id: str, new_status: str, *, extra: dict | None = None):
+    """
+    General status update. Does NOT overwrite worker_id.
+    worker_id should be written only during claim_job().
+    """
     extra = extra or {}
-    expr = "SET #s=:s, updated_at=:u, worker_id=:w"
+    expr = "SET #s=:s, updated_at=:u"
     names = {"#s": "status"}
     vals = {
         ":s": {"S": new_status},
         ":u": {"N": str(now_ms())},
-        ":w": {"S": WORKER_ID},
     }
 
     # extra fields
@@ -41,19 +70,13 @@ def ddb_set_status(job_id: str, new_status: str, *, only_if_status: str | None =
         else:
             vals[f":{k}"] = {"S": json.dumps(v, ensure_ascii=False)}
 
-    kwargs = {
-        "TableName": DDB_TABLE,
-        "Key": {"job_id": {"S": job_id}},
-        "UpdateExpression": expr,
-        "ExpressionAttributeNames": names,
-        "ExpressionAttributeValues": vals,
-    }
-
-    if only_if_status is not None:
-        kwargs["ConditionExpression"] = "#s = :q"
-        vals[":q"] = {"S": only_if_status}
-
-    ddb.update_item(**kwargs)
+    ddb.update_item(
+        TableName=DDB_TABLE,
+        Key={"job_id": {"S": job_id}},
+        UpdateExpression=expr,
+        ExpressionAttributeNames=names,
+        ExpressionAttributeValues=vals,
+    )
 
 def s3_object_exists(bucket: str, key: str) -> bool:
     try:
@@ -67,7 +90,6 @@ def s3_object_exists(bucket: str, key: str) -> bool:
 
 def dummy_ocr(local_in_path: Path) -> dict:
     # Phase 1: แค่พิสูจน์ระบบไหลครบวงจร
-    # (ทีหลังค่อยเสียบ OCR จริง)
     size = local_in_path.stat().st_size if local_in_path.exists() else 0
     return {
         "text": "dummy",
@@ -106,13 +128,19 @@ def main():
                 sqs.delete_message(QueueUrl=SQS_URL, ReceiptHandle=receipt)
                 continue
         except Exception as e:
-            print(f"[worker] head_object error: {e}")
+            # infra read error; do not treat as claimed/not-claimed
+            print(f"[worker] head_object error: {type(e).__name__}: {e}")
 
-        # lock: PROCESSING ได้เฉพาะตอน QUEUED
+        # atomic claim
         try:
-            ddb_set_status(job_id, "PROCESSING", only_if_status="QUEUED")
-        except ClientError:
-            print(f"[worker] job {job_id} not QUEUED -> delete msg")
+            ok = claim_job(job_id)
+        except Exception as e:
+            # Real infra error (permission/outage/etc). Fail loud.
+            print(f"[worker] claim error job {job_id}: {type(e).__name__}: {e}")
+            raise
+
+        if not ok:
+            print(f"[worker] job {job_id} already claimed/not QUEUED -> delete msg")
             sqs.delete_message(QueueUrl=SQS_URL, ReceiptHandle=receipt)
             continue
 
@@ -152,10 +180,14 @@ def main():
             sqs.delete_message(QueueUrl=SQS_URL, ReceiptHandle=receipt)
 
         finally:
-            try: local_in.unlink(missing_ok=True)
-            except Exception: pass
-            try: local_out.unlink(missing_ok=True)
-            except Exception: pass
+            try:
+                local_in.unlink(missing_ok=True)
+            except Exception:
+                pass
+            try:
+                local_out.unlink(missing_ok=True)
+            except Exception:
+                pass
 
 if __name__ == "__main__":
     main()
