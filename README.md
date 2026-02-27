@@ -1,21 +1,33 @@
-Hybrid OCR Infrastructure Production-Inspired Asynchronous Processing
-System (AWS)
-
+Hybrid OCR Infrastructure
+Production-Inspired Asynchronous Processing System (AWS)
 
 Overview
 
-This project is a Production-inspired asynchronous OCR processing system built using AWS S3, SQS, and DynamoDB.
+This project is a production-inspired asynchronous OCR processing system built on AWS using:
+
+-Amazon S3
+
+-Amazon SQS (Standard Queue)
+
+-Amazon DynamoDB
 
 It demonstrates:
 
--   Decoupled architecture
--   At-least-once delivery handling
--   Idempotent worker design
--   Conditional writes in DynamoDB
--   Failure-aware state transitions
--   Dockerized services
--   Local orchestration via Docker Compose
+-Decoupled architecture
 
+-At-least-once delivery handling
+
+-Idempotent worker design
+
+-Atomic concurrency control using DynamoDB conditional updates
+
+-Failure-aware state transitions
+
+-Dockerized services
+
+-Local orchestration via Docker Compose
+
+The focus of this project is infrastructure reliability and distributed system behavior rather than OCR accuracy.
 --------------------------------------------------------------
 
 Architecture Flow
@@ -32,17 +44,86 @@ Flask API
 v
 Worker (poll SQS)
 |
-|-- Process OCR
+|-- Atomic job claim (QUEUED -> PROCESSING)
+|-- Download input -> S3
+|-- Run OCR
 |-- Upload result -> S3
 |-- Update job (DONE / FAILED) -> DynamoDB
 |-- Delete message -> SQS
 
-Design principles:
--DynamoDB is the source of truth
--S3 stores input and result files
--SQS provides async decoupling
--Worker is idempotent
--Safe against crash scenarios
+
+--------------------------------------------------------------
+
+Core Design Principles
+
+DynamoDB is the source of truth
+
+S3 stores immutable input and result artifacts
+
+SQS provides asynchronous decoupling (at-least-once delivery)
+
+Worker processing is idempotent
+
+System is safe against crash and duplicate delivery scenarios
+
+--------------------------------------------------------------
+
+Concurrency Control
+
+SQS Standard Queue provides at-least-once delivery.
+This means multiple workers may receive the same message.
+
+To prevent duplicate processing, the system implements atomic job claiming
+using DynamoDB conditional updates.
+
+Only one worker can transition:
+
+QUEUED -> PROCESSING
+
+using a conditional expression on the status attribute.
+
+If the condition fails, another worker has already claimed the job,
+and the message is safely discarded.
+
+This prevents race conditions without requiring a separate lock service.
+
+--------------------------------------------------------------
+
+Idempotency Strategy
+
+The worker is safe under duplicate message delivery:
+
+Result S3 keys are deterministic (results/<job_id>/result.json)
+
+If result already exists, the worker skips processing
+
+DynamoDB state transitions are guarded with conditional writes
+
+Even if:
+
+A worker crashes before deleting the SQS message
+
+Visibility timeout expires
+
+Another worker receives the same message
+
+The system remains consistent.
+
+--------------------------------------------------------------
+
+Failure Handling
+
+This system handles:
+
+-Worker crash before delete_message
+
+-Crash after result upload but before DynamoDB update
+
+-Duplicate message delivery
+
+-Conditional write conflicts
+
+DynamoDB conditional expressions prevent invalid state transitions.
 
 --------------------------------------------------------------
 
@@ -101,62 +182,7 @@ Health check:
 curl http://localhost:8000/health
 
 --------------------------------------------------------------
-
-API Endpoints
-
-Create Job
-
-POST /jobs
-Header: x-api-key: <OCR_API_KEY>
-Content-Type: multipart/form-data
-Field: file
-
-Response:
-
-{
-"job_id": "...",
-"status": "QUEUED"
-}
-
 --------------------------------------------------------------
-
-Get Job Status
-
-GET /jobs/<job_id>
-Header: x-api-key: <OCR_API_KEY>
-
-Possible states:
-
--QUEUED
--PROCESSING
--DONE
--FAILED
-
-If DONE, a presigned S3 download URL is returned.
-
---------------------------------------------------------------
-
-Failure Handling
-
-This system handles:
--At-least-once delivery (SQS Standard)
--Worker crash before delete_message
--Crash after result upload but before DynamoDB update
--Idempotent job execution
-DynamoDB conditional expressions prevent duplicate state transitions.
-
-------------------------------------------------------------
-
-Engineering Concepts Demonstrated
-
--Asynchronous processing
--Decoupled architecture
--Message-driven systems
--Visibility timeout awareness
--Idempotent design
--Production-style containerization
-
-------------------------------------------------------------
 
 Author
 
