@@ -78,6 +78,42 @@ def ddb_set_status(job_id: str, new_status: str, *, extra: dict | None = None):
         ExpressionAttributeValues=vals,
     )
 
+def ddb_release_to_queued(job_id: str, *, error_code: str, error_message: str, receive_count: int):
+    ddb.update_item(
+        TableName=DDB_TABLE,
+        Key={"job_id": {"S": job_id}},
+        UpdateExpression="SET #s=:q, updated_at=:u, last_error_code=:c, last_error_message=:m, retry_count=:r",
+        ConditionExpression="#s = :p AND worker_id = :w",
+        ExpressionAttributeNames={"#s": "status"},
+        ExpressionAttributeValues={
+            ":q": {"S": "QUEUED"},
+            ":p": {"S": "PROCESSING"},
+            ":w": {"S": WORKER_ID},
+            ":u": {"N": str(now_ms())},
+            ":c": {"S": error_code},
+            ":m": {"S": error_message[:900]},
+            ":r": {"N": str(receive_count)},
+        },
+    )
+
+def ddb_fail_final(job_id: str, *, error_code: str, error_message: str, receive_count: int):
+    ddb.update_item(
+        TableName=DDB_TABLE,
+        Key={"job_id": {"S": job_id}},
+        UpdateExpression="SET #s=:f, updated_at=:u, error_code=:c, error_message=:m, retry_count=:r",
+        ConditionExpression="#s = :p AND worker_id = :w",
+        ExpressionAttributeNames={"#s": "status"},
+        ExpressionAttributeValues={
+            ":f": {"S": "FAILED"},
+            ":p": {"S": "PROCESSING"},
+            ":w": {"S": WORKER_ID},
+            ":u": {"N": str(now_ms())},
+            ":c": {"S": error_code},
+            ":m": {"S": error_message[:900]},
+            ":r": {"N": str(receive_count)},
+        },
+    )
+
 def s3_object_exists(bucket: str, key: str) -> bool:
     try:
         s3.head_object(Bucket=bucket, Key=key)
@@ -87,6 +123,33 @@ def s3_object_exists(bucket: str, key: str) -> bool:
         if code in ("404", "NoSuchKey", "NotFound"):
             return False
         raise
+
+def classify_error(e: Exception) -> tuple[str, bool]:
+    """
+    returns: (error_code, is_permanent)
+    """
+    if isinstance(e, ClientError):
+        code = e.response.get("Error", {}).get("Code", "ClientError")
+
+        # Permanent: input not found / invalid request
+        if code in ("NoSuchKey", "NotFound", "404", "NoSuchBucket"):
+            return code, True
+
+        # Transient: throttling / temporary AWS issues
+        if code in (
+            "ThrottlingException",
+            "ProvisionedThroughputExceededException",
+            "RequestLimitExceeded",
+            "InternalError",
+            "ServiceUnavailable",
+        ):
+            return code, False
+
+        # Default: treat other ClientErrors as transient
+        return code, False
+
+    # Non-ClientError: usually transient (timeouts/network/runtime)
+    return type(e).__name__, False
 
 def dummy_ocr(local_in_path: Path) -> dict:
     # Phase 1: แค่พิสูจน์ระบบไหลครบวงจร
@@ -106,13 +169,15 @@ def main():
         resp = sqs.receive_message(
             QueueUrl=SQS_URL,
             MaxNumberOfMessages=1,
-            WaitTimeSeconds=20,  # long polling
+            WaitTimeSeconds=20,
+            AttributeNames=["ApproximateReceuveCount"],
         )
         msgs = resp.get("Messages", [])
         if not msgs:
             continue
 
         m = msgs[0]
+        receive_count = int(m.get("Attributes", {}).get("ApproximateReceiveCount", "1"))
         receipt = m["ReceiptHandle"]
         body = json.loads(m["Body"])
 
@@ -144,11 +209,15 @@ def main():
             sqs.delete_message(QueueUrl=SQS_URL, ReceiptHandle=receipt)
             continue
 
+
         local_in = Path(f"/tmp/{job_id}.bin")
         local_out = Path(f"/tmp/{job_id}.json")
 
         try:
             print(f"[worker] job {job_id} downloading s3://{bucket}/{input_key}")
+
+            raise RuntimeError("TransientTest")
+
             s3.download_file(bucket, input_key, str(local_in))
 
             t0 = now_ms()
@@ -172,12 +241,25 @@ def main():
 
         except Exception as e:
             err = f"{type(e).__name__}: {e}"
-            print(f"[worker] job {job_id} FAILED: {err}")
-            try:
-                ddb_set_status(job_id, "FAILED", extra={"error_message": err})
-            except Exception:
-                pass
-            sqs.delete_message(QueueUrl=SQS_URL, ReceiptHandle=receipt)
+            error_code, is_permanent = classify_error(e)
+            print(f"[worker] job {job_id} ERROR({error_code}) receive_count={receive_count}: {err}")
+
+            if is_permanent:
+                # Permanent -> mark FAILED and delete message
+                try:
+                    ddb_fail_final(job_id, error_code=error_code, error_message=err, receive_count=receive_count)
+                except Exception:
+                    pass
+                sqs.delete_message(QueueUrl=SQS_URL, ReceiptHandle=receipt)
+                print(f"[worker] job {job_id} FAILED(permanent) -> deleted msg")
+            else:
+                # Transient -> release to QUEUED and DO NOT delete (let SQS retry / DLQ)
+                try:
+                    ddb_release_to_queued(job_id, error_code=error_code, error_message=err, receive_count=receive_count)
+                except Exception:
+                    pass
+                print(f"[worker] job {job_id} transient -> keep msg for retry (DLQ after maxReceiveCount)")
+
 
         finally:
             try:
