@@ -1,7 +1,7 @@
 {
   "job_id": "case-transient-001",
-  "bucket": "hybrid-ocr-dev-uploads-1770938266",
-  "input_key": "uploads/case-transient-001/ok.bin",
-  "result_key": "results/case-transient-001/result.json",
+  "bucket": "example-bucket",
+  "input_key": "uploads/sample.bin",
+  "result_key": "results/sample.json",
   "force_error": "transient"
 }
