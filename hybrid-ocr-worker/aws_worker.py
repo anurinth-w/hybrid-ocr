@@ -6,7 +6,12 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 import boto3
-from botocore.exceptions import ClientError, EndpointConnectionError, ConnectionClosedError, ReadTimeoutError
+from botocore.exceptions import (
+    ClientError,
+    EndpointConnectionError,
+    ConnectionClosedError,
+    ReadTimeoutError,
+)
 
 AWS_REGION = os.getenv("AWS_REGION", "ap-southeast-1")
 SQS_URL = os.getenv("OCR_SQS_URL")
@@ -29,6 +34,16 @@ ddb = session.client("dynamodb")
 
 def now_ms() -> int:
     return int(time.time() * 1000)
+
+
+def log_event(event: str, **fields: Any) -> None:
+    payload = {
+        "event": event,
+        "ts": now_ms(),
+        "worker_id": WORKER_ID,
+        **fields,
+    }
+    print(json.dumps(payload, ensure_ascii=False), flush=True)
 
 
 # -------------------------
@@ -62,8 +77,9 @@ def claim_job(job_id: str) -> Tuple[bool, Optional[str]]:
             TableName=DDB_TABLE,
             Key={"job_id": {"S": job_id}},
             UpdateExpression=(
-                "SET #s=:p, worker_id=:w, processing_started_at=:t, updated_at=:t "
-                "REMOVE error_code, error_message"
+                "SET #s=:p, worker_id=:w, last_worker_id=:w, "
+                "processing_started_at=:t, updated_at=:t "
+                "REMOVE error_code, error_message, failure_type"
             ),
             ConditionExpression="#s = :q",
             ExpressionAttributeNames={"#s": "status"},
@@ -86,7 +102,8 @@ def claim_job(job_id: str) -> Tuple[bool, Optional[str]]:
 
 def ddb_set_status(job_id: str, new_status: str, *, extra: Optional[Dict[str, Any]] = None) -> None:
     """
-    General status update. Does NOT overwrite worker_id by default.
+    General status update.
+    Does NOT overwrite worker_id by default.
     """
     extra = extra or {}
     expr = "SET #s=:s, updated_at=:u"
@@ -99,10 +116,11 @@ def ddb_set_status(job_id: str, new_status: str, *, extra: Optional[Dict[str, An
     for k, v in extra.items():
         if v is None:
             continue
-        # Note: attribute names are assumed safe here; keep to snake_case keys.
         expr += f", {k}=:{k}"
         if isinstance(v, str):
             vals[f":{k}"] = {"S": v}
+        elif isinstance(v, bool):
+            vals[f":{k}"] = {"BOOL": v}
         elif isinstance(v, (int, float)):
             vals[f":{k}"] = {"N": str(int(v))}
         else:
@@ -120,9 +138,7 @@ def ddb_set_status(job_id: str, new_status: str, *, extra: Optional[Dict[str, An
 def ddb_release_to_queued(job_id: str, *, reason: str, receive_count: int) -> None:
     """
     On transient error:
-      PROCESSING -> QUEUED (so future retry can claim again)
-    We do NOT condition on worker_id to keep it simple in dev,
-    but we do condition that status is PROCESSING (avoid clobbering DONE).
+      PROCESSING -> QUEUED
     """
     if not TRANSIENT_RELEASE_TO_QUEUED:
         return
@@ -132,7 +148,11 @@ def ddb_release_to_queued(job_id: str, *, reason: str, receive_count: int) -> No
         ddb.update_item(
             TableName=DDB_TABLE,
             Key={"job_id": {"S": job_id}},
-            UpdateExpression="SET #s=:q, updated_at=:t, last_error_at=:t, error_code=:c, error_message=:m, last_receive_count=:rc",
+            UpdateExpression=(
+                "SET #s=:q, updated_at=:t, last_error_at=:t, "
+                "error_code=:c, error_message=:m, failure_type=:ft, "
+                "last_receive_count=:rc, last_worker_id=:w"
+            ),
             ConditionExpression="#s = :p",
             ExpressionAttributeNames={"#s": "status"},
             ExpressionAttributeValues={
@@ -141,11 +161,13 @@ def ddb_release_to_queued(job_id: str, *, reason: str, receive_count: int) -> No
                 ":t": {"N": str(t)},
                 ":c": {"S": "TransientError"},
                 ":m": {"S": reason},
+                ":ft": {"S": "TRANSIENT"},
                 ":rc": {"N": str(receive_count)},
+                ":w": {"S": WORKER_ID},
             },
         )
     except ClientError:
-        # Don't die on release failure; worst case it stays PROCESSING and will be handled by future recovery.
+        # Worst case it stays PROCESSING; don't crash worker for this.
         pass
 
 
@@ -169,16 +191,13 @@ def s3_object_exists(bucket: str, key: str) -> bool:
 # -------------------------
 
 def is_permanent_error(exc: Exception) -> bool:
-    # Your own explicit test hook
     if isinstance(exc, RuntimeError) and "PermanentTest" in str(exc):
         return True
 
     if isinstance(exc, ClientError):
         code = exc.response.get("Error", {}).get("Code", "")
-        # S3 missing input = permanent (bad key or missing upload)
         if code in ("NoSuchKey", "NotFound", "404"):
             return True
-        # AccessDenied is usually config/permission (treat as permanent for now)
         if code in ("AccessDenied", "InvalidAccessKeyId", "SignatureDoesNotMatch"):
             return True
 
@@ -186,17 +205,14 @@ def is_permanent_error(exc: Exception) -> bool:
 
 
 def is_transient_error(exc: Exception) -> bool:
-    # Your explicit test hook
     if isinstance(exc, RuntimeError) and "TransientTest" in str(exc):
         return True
 
-    # Network-ish errors
     if isinstance(exc, (EndpointConnectionError, ConnectionClosedError, ReadTimeoutError)):
         return True
 
     if isinstance(exc, ClientError):
         code = exc.response.get("Error", {}).get("Code", "")
-        # Throttling / timeouts / temporary service issues
         if code in (
             "Throttling",
             "ThrottlingException",
@@ -207,7 +223,6 @@ def is_transient_error(exc: Exception) -> bool:
             "ServiceUnavailable",
         ):
             return True
-        # Many 5xx come as "500" style or "SlowDown" for S3
         if code in ("SlowDown",) or code.startswith("5"):
             return True
 
@@ -231,14 +246,21 @@ def main() -> None:
     if not (SQS_URL and DDB_TABLE):
         raise SystemExit("Missing env: OCR_SQS_URL and/or OCR_DDB_TABLE")
 
-    print(f"[worker] started worker_id={WORKER_ID} region={AWS_REGION}")
+    log_event(
+        "worker_started",
+        aws_region=AWS_REGION,
+        queue_url=SQS_URL,
+        ddb_table=DDB_TABLE,
+        long_poll_seconds=LONG_POLL_SECONDS,
+        max_messages=MAX_MESSAGES,
+    )
 
     while True:
         resp = sqs.receive_message(
             QueueUrl=SQS_URL,
             MaxNumberOfMessages=MAX_MESSAGES,
             WaitTimeSeconds=LONG_POLL_SECONDS,
-            AttributeNames=["ApproximateReceiveCount"],  # ✅ correct spelling
+            AttributeNames=["ApproximateReceiveCount"],
         )
 
         msgs = resp.get("Messages", [])
@@ -251,13 +273,25 @@ def main() -> None:
             attrs = m.get("Attributes", {}) or {}
             receive_count = int(attrs.get("ApproximateReceiveCount", "1"))
 
-            # Parse JSON safely; if bad message, delete it (poison)
+            log_event(
+                "message_received",
+                receive_count=receive_count,
+                body_preview=raw_body[:200],
+            )
+
+            # Parse JSON safely; if bad message, delete it
             try:
                 body = json.loads(raw_body)
                 if not isinstance(body, dict):
                     raise ValueError("Body JSON is not an object")
             except Exception as e:
-                print(f"[worker] BAD_MESSAGE_BODY -> delete msg rc={receive_count} err={type(e).__name__}: {e} body_preview={raw_body[:200]!r}")
+                log_event(
+                    "bad_message_body_deleted",
+                    receive_count=receive_count,
+                    error_type=type(e).__name__,
+                    error_message=str(e),
+                    body_preview=raw_body[:200],
+                )
                 sqs.delete_message(QueueUrl=SQS_URL, ReceiptHandle=receipt)
                 continue
 
@@ -269,77 +303,175 @@ def main() -> None:
             force_error = body.get("force_error")  # optional: transient/permanent
 
             if not (job_id and bucket and input_key and result_key):
-                print(f"[worker] BAD_MESSAGE_FIELDS -> delete msg rc={receive_count} body={body}")
+                log_event(
+                    "bad_message_fields_deleted",
+                    receive_count=receive_count,
+                    body=body,
+                )
                 sqs.delete_message(QueueUrl=SQS_URL, ReceiptHandle=receipt)
                 continue
 
-            # 1) Idempotency shortcut: if result exists, delete msg (and optionally mark DONE)
+            log_event(
+                "job_parsed",
+                job_id=job_id,
+                bucket=bucket,
+                input_key=input_key,
+                result_key=result_key,
+                receive_count=receive_count,
+                force_error=force_error,
+            )
+
+            # 1) Idempotency shortcut
             try:
                 if s3_object_exists(bucket, result_key):
-                    print(f"[worker] job {job_id} result exists -> delete msg rc={receive_count}")
+                    log_event(
+                        "job_result_exists",
+                        job_id=job_id,
+                        bucket=bucket,
+                        result_key=result_key,
+                        receive_count=receive_count,
+                        action="delete_message",
+                    )
                     if MARK_DONE_IF_RESULT_EXISTS:
                         try:
-                            ddb_set_status(job_id, "DONE", extra={"note": "result_already_exists"})
-                        except Exception:
-                            pass
+                            ddb_set_status(
+                                job_id,
+                                "DONE",
+                                extra={
+                                    "note": "result_already_exists",
+                                    "last_worker_id": WORKER_ID,
+                                },
+                            )
+                        except Exception as e:
+                            log_event(
+                                "ddb_mark_done_if_result_exists_failed",
+                                job_id=job_id,
+                                error_type=type(e).__name__,
+                                error_message=str(e),
+                            )
                     sqs.delete_message(QueueUrl=SQS_URL, ReceiptHandle=receipt)
                     continue
             except Exception as e:
-                print(f"[worker] job {job_id} head_object error (non-fatal): {type(e).__name__}: {e}")
+                log_event(
+                    "result_exists_check_failed",
+                    job_id=job_id,
+                    bucket=bucket,
+                    result_key=result_key,
+                    error_type=type(e).__name__,
+                    error_message=str(e),
+                )
 
             # 2) Atomic claim
             try:
                 claimed, current_status = claim_job(job_id)
             except Exception as e:
-                # Infra error: better to fail loud (dev) so you see it
-                print(f"[worker] claim error job {job_id}: {type(e).__name__}: {e}")
+                log_event(
+                    "job_claim_error",
+                    job_id=job_id,
+                    receive_count=receive_count,
+                    error_type=type(e).__name__,
+                    error_message=str(e),
+                )
                 raise
 
             if not claimed:
-                # If item missing: poison message -> mark FAILED + delete
                 if current_status is None:
-                    print(f"[worker] job {job_id} missing in DDB -> FAILED(permanent) + delete msg rc={receive_count}")
+                    log_event(
+                        "job_missing_in_ddb_deleted",
+                        job_id=job_id,
+                        receive_count=receive_count,
+                        action="mark_failed_and_delete",
+                    )
                     try:
-                        ddb_set_status(job_id, "FAILED", extra={"error_code": "MissingDDBItem", "error_message": "Message received but DDB item not found"})
-                    except Exception:
-                        pass
+                        ddb_set_status(
+                            job_id,
+                            "FAILED",
+                            extra={
+                                "error_code": "MissingDDBItem",
+                                "error_message": "Message received but DDB item not found",
+                                "failure_type": "PERMANENT",
+                                "last_worker_id": WORKER_ID,
+                                "last_receive_count": receive_count,
+                            },
+                        )
+                    except Exception as e:
+                        log_event(
+                            "ddb_mark_missing_job_failed_error",
+                            job_id=job_id,
+                            error_type=type(e).__name__,
+                            error_message=str(e),
+                        )
                     sqs.delete_message(QueueUrl=SQS_URL, ReceiptHandle=receipt)
                     continue
 
-                # If not QUEUED (e.g., PROCESSING/DONE/FAILED):
-                # - DONE/FAILED: safe to delete msg
                 if current_status in ("DONE", "FAILED"):
-                    print(f"[worker] job {job_id} status={current_status} -> delete msg rc={receive_count}")
+                    log_event(
+                        "job_not_claimable_deleted",
+                        job_id=job_id,
+                        current_status=current_status,
+                        receive_count=receive_count,
+                    )
                     sqs.delete_message(QueueUrl=SQS_URL, ReceiptHandle=receipt)
                     continue
 
-                # - PROCESSING or others: DO NOT delete (let it retry or wait)
-                print(f"[worker] job {job_id} status={current_status} (not claimable) -> keep msg rc={receive_count} (delay {CLAIM_FAIL_VISIBILITY_DELAY}s)")
+                log_event(
+                    "job_not_claimable_visibility_changed",
+                    job_id=job_id,
+                    current_status=current_status,
+                    receive_count=receive_count,
+                    visibility_timeout=CLAIM_FAIL_VISIBILITY_DELAY,
+                )
                 try:
                     sqs.change_message_visibility(
                         QueueUrl=SQS_URL,
                         ReceiptHandle=receipt,
                         VisibilityTimeout=CLAIM_FAIL_VISIBILITY_DELAY,
                     )
-                except Exception:
-                    pass
+                except Exception as e:
+                    log_event(
+                        "change_visibility_failed",
+                        job_id=job_id,
+                        receive_count=receive_count,
+                        error_type=type(e).__name__,
+                        error_message=str(e),
+                    )
                 continue
 
-            # Claimed OK: proceed
+            log_event(
+                "job_claimed",
+                job_id=job_id,
+                receive_count=receive_count,
+                status="PROCESSING",
+            )
+
             local_in = Path(f"/tmp/{job_id}.bin")
             local_out = Path(f"/tmp/{job_id}.json")
 
             try:
-                # Test hooks: controlled error injection
                 if force_error == "transient":
                     raise RuntimeError("TransientTest")
                 if force_error == "permanent":
                     raise RuntimeError("PermanentTest")
 
-                print(f"[worker] job {job_id} downloading s3://{bucket}/{input_key} rc={receive_count}")
+                log_event(
+                    "job_download_started",
+                    job_id=job_id,
+                    bucket=bucket,
+                    input_key=input_key,
+                    receive_count=receive_count,
+                )
                 s3.download_file(bucket, input_key, str(local_in))
+                log_event(
+                    "job_download_finished",
+                    job_id=job_id,
+                    bucket=bucket,
+                    input_key=input_key,
+                    receive_count=receive_count,
+                    local_path=str(local_in),
+                )
 
                 t0 = now_ms()
+                log_event("job_processing_started", job_id=job_id, receive_count=receive_count)
                 result = dummy_ocr(local_in)
                 duration = now_ms() - t0
 
@@ -349,42 +481,107 @@ def main() -> None:
                     "duration_ms": duration,
                     "result": result,
                 }
-                local_out.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+                local_out.write_text(
+                    json.dumps(payload, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
 
-                print(f"[worker] job {job_id} uploading result s3://{bucket}/{result_key} rc={receive_count}")
+                log_event(
+                    "job_upload_started",
+                    job_id=job_id,
+                    bucket=bucket,
+                    result_key=result_key,
+                    receive_count=receive_count,
+                    duration_ms=duration,
+                )
                 s3.upload_file(str(local_out), bucket, result_key)
 
-                ddb_set_status(job_id, "DONE", extra={"duration_ms": duration})
+                ddb_set_status(
+                    job_id,
+                    "DONE",
+                    extra={
+                        "duration_ms": duration,
+                        "last_worker_id": WORKER_ID,
+                        "last_receive_count": receive_count,
+                    },
+                )
                 sqs.delete_message(QueueUrl=SQS_URL, ReceiptHandle=receipt)
-                print(f"[worker] job {job_id} DONE rc={receive_count}")
+
+                log_event(
+                    "job_done",
+                    job_id=job_id,
+                    receive_count=receive_count,
+                    duration_ms=duration,
+                    result_key=result_key,
+                    status="DONE",
+                )
 
             except Exception as e:
                 err = f"{type(e).__name__}: {e}"
 
                 if is_permanent_error(e) and not is_transient_error(e):
-                    # Permanent: mark FAILED and delete
-                    print(f"[worker] job {job_id} FAILED(permanent) rc={receive_count}: {err} -> delete msg")
+                    log_event(
+                        "job_failed_permanent",
+                        job_id=job_id,
+                        receive_count=receive_count,
+                        error_code="PermanentError",
+                        error_message=err,
+                        action="mark_failed_and_delete",
+                    )
                     try:
-                        ddb_set_status(job_id, "FAILED", extra={"error_code": "PermanentError", "error_message": err, "last_receive_count": receive_count})
-                    except Exception:
-                        pass
+                        ddb_set_status(
+                            job_id,
+                            "FAILED",
+                            extra={
+                                "error_code": "PermanentError",
+                                "error_message": err,
+                                "failure_type": "PERMANENT",
+                                "last_receive_count": receive_count,
+                                "last_worker_id": WORKER_ID,
+                            },
+                        )
+                    except Exception as update_err:
+                        log_event(
+                            "ddb_mark_failed_error",
+                            job_id=job_id,
+                            receive_count=receive_count,
+                            error_type=type(update_err).__name__,
+                            error_message=str(update_err),
+                        )
                     sqs.delete_message(QueueUrl=SQS_URL, ReceiptHandle=receipt)
 
                 else:
-                    # Default to transient if not clearly permanent
-                    print(f"[worker] job {job_id} FAILED(transient) rc={receive_count}: {err} -> keep msg for retry (DLQ after maxReceiveCount)")
+                    log_event(
+                        "job_failed_transient",
+                        job_id=job_id,
+                        receive_count=receive_count,
+                        error_code="TransientError",
+                        error_message=err,
+                        action="release_to_queued",
+                    )
                     ddb_release_to_queued(job_id, reason=err, receive_count=receive_count)
-                    # DO NOT delete message => SQS will retry / DLQ after threshold
+                    # DO NOT delete message => SQS retry / DLQ after threshold
 
             finally:
                 try:
                     local_in.unlink(missing_ok=True)
-                except Exception:
-                    pass
+                except Exception as e:
+                    log_event(
+                        "cleanup_local_input_failed",
+                        job_id=job_id,
+                        error_type=type(e).__name__,
+                        error_message=str(e),
+                    )
+
                 try:
                     local_out.unlink(missing_ok=True)
-                except Exception:
-                    pass
+                except Exception as e:
+                    log_event(
+                        "cleanup_local_output_failed",
+                        job_id=job_id,
+                        error_type=type(e).__name__,
+                        error_message=str(e),
+                    )
 
 
 if __name__ == "__main__":
