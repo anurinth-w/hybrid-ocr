@@ -18,5 +18,6 @@ services:
       AWS_REGION: ap-southeast-1
       OCR_SQS_URL: ${OCR_SQS_URL}
       OCR_DDB_TABLE: ${OCR_DDB_TABLE}
+      OCR_TEST_MODE: ${OCR_TEST_MODE}
     volumes:
       - ~/.aws:/root/.aws:ro

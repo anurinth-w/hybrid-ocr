@@ -1,190 +1,208 @@
 Hybrid OCR Infrastructure
-Production-Inspired Asynchronous Processing System (AWS)
 
-Overview
+A distributed OCR processing system designed to simulate production-grade asynchronous job processing using AWS primitives.
 
-This project is a production-inspired asynchronous OCR processing system built on AWS using:
+This project demonstrates how to build a reliable worker-based architecture with retry handling, failure classification, and dead-letter queue (DLQ) strategy.
 
--Amazon S3
+The goal of this project is to practice system design concepts used in backend / DevOps / platform engineering roles.
 
--Amazon SQS (Standard Queue)
+----------------------------------------------------------------------------------------------
 
--Amazon DynamoDB
-
-It demonstrates:
-
--Decoupled architecture
-
--At-least-once delivery handling
-
--Idempotent worker design
-
--Atomic concurrency control using DynamoDB conditional updates
-
--Failure-aware state transitions
-
--Dockerized services
-
--Local orchestration via Docker Compose
-
-The focus of this project is infrastructure reliability and distributed system behavior rather than OCR accuracy.
---------------------------------------------------------------
-
-Architecture Flow
-
+Architecture Overview
 Client
-|
-v
-Flask API
-|
-|-- Upload file -> S3
-|-- Create job (QUEUED) -> DynamoDB
-|-- Send message -> SQS
-|
-v
-Worker (poll SQS)
-|
-|-- Atomic job claim (QUEUED -> PROCESSING)
-|-- Download input -> S3
-|-- Run OCR
-|-- Upload result -> S3
-|-- Update job (DONE / FAILED) -> DynamoDB
-|-- Delete message -> SQS
+  ↓
+API (Flask / Gunicorn)
+  ↓
+S3 (store uploaded files)
+  ↓
+DynamoDB (source of truth for job state)
+  ↓
+SQS (job queue)
+  ↓
+Worker
+  ↓
+S3 (store OCR result)
 
+System components:
 
---------------------------------------------------------------
+-API – accepts file uploads and creates OCR jobs
+-S3 – stores input documents and OCR results
+-DynamoDB – tracks job state
+-SQS – queues jobs for asynchronous processing
+-Worker – processes jobs and performs OCR
 
-Core Design Principles
+----------------------------------------------------------------------------------------------
 
-DynamoDB is the source of truth
+Job Lifecycle
 
-S3 stores immutable input and result artifacts
+Each job moves through a defined state machine:
 
-SQS provides asynchronous decoupling (at-least-once delivery)
+QUEUED
+  ↓
+PROCESSING
+  ↓
+DONE
 
-Worker processing is idempotent
+Failure paths:
 
-System is safe against crash and duplicate delivery scenarios
+PROCESSING
+  ↓
+FAILED (permanent error)
 
---------------------------------------------------------------
+or
 
-Concurrency Control
+PROCESSING
+  ↓
+QUEUED (transient error → retry)
+  ↓
+DLQ (after maxReceiveCount)
 
-SQS Standard Queue provides at-least-once delivery.
-This means multiple workers may receive the same message.
+----------------------------------------------------------------------------------------------
 
-To prevent duplicate processing, the system implements atomic job claiming
-using DynamoDB conditional updates.
+Failure Handling Strategy
 
-Only one worker can transition:
+The worker classifies failures into two categories.
 
-QUEUED -> PROCESSING
+Permanent Errors
 
-using a conditional expression on the status attribute.
+Examples:
 
-If the condition fails, another worker has already claimed the job,
-and the message is safely discarded.
+-Invalid input
+-Corrupt files
+-Logic errors
 
-This prevents race conditions without requiring a separate lock service.
+Behavior:
 
---------------------------------------------------------------
+  PROCESSING → FAILED
+  SQS message deleted
 
-Idempotency Strategy
+----------------------------------------------------------------------------------------------
 
-The worker is safe under duplicate message delivery:
+Transient Errors
 
-Result S3 keys are deterministic (results/<job_id>/result.json)
+Examples:
 
-If result already exists, the worker skips processing
+-Network timeouts
+-Temporary AWS service errors
 
-DynamoDB state transitions are guarded with conditional writes
+Behavior:
 
-Even if:
+  PROCESSING → QUEUED
+  Message not deleted
+  SQS retries automatically
 
-A worker crashes before deleting the SQS message
+If retries exceed maxReceiveCount, the message moves to the Dead Letter Queue (DLQ).
 
-Visibility timeout expires
+----------------------------------------------------------------------------------------------
 
-Another worker receives the same message
+Idempotency
 
-The system remains consistent.
+The system implements idempotent job processing.
 
---------------------------------------------------------------
+If the result file already exists in S3:
 
-Failure Handling
+worker detects existing result
+→ skips processing
+→ deletes message
 
-This system handles:
+This prevents duplicate work when messages are retried.
 
--Worker crash before delete_message
+----------------------------------------------------------------------------------------------
 
--Crash after result upload but before DynamoDB update
+Local Development
 
--Duplicate message delivery
+Run the system locally using Docker:
 
--Conditional write conflicts
+  docker compose up --build
 
-DynamoDB conditional expressions prevent invalid state transitions.
+API will start on:
 
---------------------------------------------------------------
+  http://localhost:8000
 
-Tech Stack
--Python 3.11
+----------------------------------------------------------------------------------------------
+
+Create a Job
+
+Upload a document:
+
+  curl -X POST http://localhost:8000/jobs   -H "x-api-key: changeme"   -F "file=@document.pdf"
+
+Response:
+
+  {
+    "job_id": "uuid",
+    "status": "QUEUED"
+  }
+
+----------------------------------------------------------------------------------------------
+
+Worker Processing Flow
+
+Worker steps:
+
+1.Receive message from SQS
+2.Atomically claim job in DynamoDB
+3.Download input file from S3
+4.Run OCR
+5.Upload result to S3
+6.Update job status in DynamoDB
+
+----------------------------------------------------------------------------------------------
+
+Test Scenarios
+
+The system was tested with three scenarios.
+
+Success
+  QUEUED → PROCESSING → DONE
+
+Permanent Failure
+  PROCESSING → FAILED
+  message deleted
+
+Transient Failure
+  PROCESSING → QUEUED
+  retry
+  DLQ after maxReceiveCount
+
+----------------------------------------------------------------------------------------------
+
+Technology Stack
+
+-Python
 -Flask
--Gunicorn
--boto3
+-Docker
 -AWS S3
 -AWS SQS
 -AWS DynamoDB
--Docker
--Docker Compose
 
---------------------------------------------------------------
+----------------------------------------------------------------------------------------------
 
-Project Structure
+Learning Goals
 
-hybrid-ocr/
-|
-|-- hybrid-ocr-api/
-| |-- app.py
-| |-- Dockerfile
-| |-- requirements.txt
-|
-|-- hybrid-ocr-worker/
-| |-- aws_worker.py
-| |-- Dockerfile
-| |-- requirements.txt
-|
-|-- docker-compose.yml
-|-- .env.example
-|-- README.md
+This project focuses on understanding:
 
---------------------------------------------------------------
+-distributed worker systems
+-retry policies
+-DLQ architecture
+-idempotent processing
+-atomic job claiming
+-failure classification
 
-Environment Variables
+----------------------------------------------------------------------------------------------
 
-Create a .env file in the project root:
+Future Improvements
 
-OCR_API_KEY=changeme
-OCR_S3_BUCKET=your-bucket-name
-OCR_SQS_URL=https://sqs.ap-southeast-1.amazonaws.com/ACCOUNT_ID/queue-name
-OCR_DDB_TABLE=your-ddb-table
-AWS_REGION=ap-southeast-1
+Planned improvements:
 
---------------------------------------------------------------
+-structured JSON logging
+-CloudWatch metrics and alarms
+-Terraform infrastructure provisioning
+-worker autoscaling
+-Kubernetes deployment
 
-Running Locally
-
-Build and start both services:
-docker compose up --build
-API will be available at:
-http://localhost:8000
-Health check:
-curl http://localhost:8000/health
-
---------------------------------------------------------------
---------------------------------------------------------------
+----------------------------------------------------------------------------------------------
 
 Author
 
 Anurinth Wichairum
-Cloud / DevOps Engineer (Aspiring)
