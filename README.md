@@ -167,6 +167,42 @@ Transient Failure
 
 ----------------------------------------------------------------------------------------------
 
+Observability
+
+The worker emits structured JSON logs for every important lifecycle event.
+
+This allows logs to be easily consumed by systems such as:
+-AWS CloudWatch
+-ELK stack
+-Datadog
+-OpenTelemetry collectors
+
+Example log event:
+{
+  "event": "job_claimed",
+  "ts": 1772895586088,
+  "worker_id": "e44958831c37",
+  "job_id": "60ba891b-7f39-40f1-9b43-833519f008ed",
+  "receive_count": 1,
+  "status": "PROCESSING"
+}
+
+Key lifecycle events emitted by the worker:
+-message_received
+-job_parsed
+-job_claimed
+-job_download_started
+-job_download_finished
+-job_processing_started
+-job_upload_started
+-job_done
+-job_failed_permanent
+-job_failed_transient
+
+These logs make it possible to reconstruct the timeline of a job execution, which is useful for debugging, monitoring, and production observability.
+
+----------------------------------------------------------------------------------------------
+
 Technology Stack
 
 -Python
