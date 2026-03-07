@@ -26,10 +26,15 @@ CLAIM_FAIL_VISIBILITY_DELAY = int(os.getenv("WORKER_CLAIM_FAIL_VIS_DELAY", "30")
 TRANSIENT_RELEASE_TO_QUEUED = os.getenv("WORKER_TRANSIENT_RELEASE_TO_QUEUED", "1") == "1"
 MARK_DONE_IF_RESULT_EXISTS = os.getenv("WORKER_MARK_DONE_IF_RESULT_EXISTS", "1") == "1"
 
+# CloudWatch metrics
+CW_NAMESPACE = os.getenv("CW_NAMESPACE", "HybridOCR")
+CW_SERVICE_DIMENSION = os.getenv("CW_SERVICE_DIMENSION", "HybridOCRWorker")
+
 session = boto3.session.Session(region_name=AWS_REGION)
 s3 = session.client("s3")
 sqs = session.client("sqs")
 ddb = session.client("dynamodb")
+cw = session.client("cloudwatch")
 
 
 def now_ms() -> int:
@@ -44,6 +49,43 @@ def log_event(event: str, **fields: Any) -> None:
         **fields,
     }
     print(json.dumps(payload, ensure_ascii=False), flush=True)
+
+
+def put_metric(
+    name: str,
+    value: float,
+    unit: str = "Count",
+    *,
+    extra_dimensions: Optional[list[dict[str, str]]] = None,
+) -> None:
+    dimensions = [
+        {"Name": "Service", "Value": CW_SERVICE_DIMENSION},
+    ]
+    if extra_dimensions:
+        dimensions.extend(extra_dimensions)
+
+    try:
+        cw.put_metric_data(
+            Namespace=CW_NAMESPACE,
+            MetricData=[
+                {
+                    "MetricName": name,
+                    "Value": value,
+                    "Unit": unit,
+                    "Dimensions": dimensions,
+                    "Timestamp": int(time.time()),
+                }
+            ],
+        )
+    except Exception as e:
+        log_event(
+            "cloudwatch_metric_error",
+            metric_name=name,
+            metric_value=value,
+            metric_unit=unit,
+            error_type=type(e).__name__,
+            error_message=str(e),
+        )
 
 
 # -------------------------
@@ -94,7 +136,6 @@ def claim_job(job_id: str) -> Tuple[bool, Optional[str]]:
     except ClientError as e:
         code = e.response.get("Error", {}).get("Code", "")
         if code == "ConditionalCheckFailedException":
-            # Either item missing OR status != QUEUED
             status = ddb_get_status(job_id)
             return False, status
         raise
@@ -108,7 +149,7 @@ def ddb_set_status(job_id: str, new_status: str, *, extra: Optional[Dict[str, An
     extra = extra or {}
     expr = "SET #s=:s, updated_at=:u"
     names = {"#s": "status"}
-    vals: Dict[str, Dict[str, str]] = {
+    vals: Dict[str, Dict[str, Any]] = {
         ":s": {"S": new_status},
         ":u": {"N": str(now_ms())},
     }
@@ -167,7 +208,6 @@ def ddb_release_to_queued(job_id: str, *, reason: str, receive_count: int) -> No
             },
         )
     except ClientError:
-        # Worst case it stays PROCESSING; don't crash worker for this.
         pass
 
 
@@ -253,6 +293,7 @@ def main() -> None:
         ddb_table=DDB_TABLE,
         long_poll_seconds=LONG_POLL_SECONDS,
         max_messages=MAX_MESSAGES,
+        cw_namespace=CW_NAMESPACE,
     )
 
     while True:
@@ -279,7 +320,6 @@ def main() -> None:
                 body_preview=raw_body[:200],
             )
 
-            # Parse JSON safely; if bad message, delete it
             try:
                 body = json.loads(raw_body)
                 if not isinstance(body, dict):
@@ -292,15 +332,15 @@ def main() -> None:
                     error_message=str(e),
                     body_preview=raw_body[:200],
                 )
+                put_metric("BadMessagesDeleted", 1)
                 sqs.delete_message(QueueUrl=SQS_URL, ReceiptHandle=receipt)
                 continue
 
-            # Required fields
             job_id = body.get("job_id")
             bucket = body.get("bucket")
             input_key = body.get("input_key")
             result_key = body.get("result_key")
-            force_error = body.get("force_error")  # optional: transient/permanent
+            force_error = body.get("force_error")
 
             if not (job_id and bucket and input_key and result_key):
                 log_event(
@@ -308,6 +348,7 @@ def main() -> None:
                     receive_count=receive_count,
                     body=body,
                 )
+                put_metric("BadMessagesDeleted", 1)
                 sqs.delete_message(QueueUrl=SQS_URL, ReceiptHandle=receipt)
                 continue
 
@@ -321,7 +362,6 @@ def main() -> None:
                 force_error=force_error,
             )
 
-            # 1) Idempotency shortcut
             try:
                 if s3_object_exists(bucket, result_key):
                     log_event(
@@ -332,6 +372,8 @@ def main() -> None:
                         receive_count=receive_count,
                         action="delete_message",
                     )
+                    put_metric("ResultAlreadyExists", 1)
+
                     if MARK_DONE_IF_RESULT_EXISTS:
                         try:
                             ddb_set_status(
@@ -340,6 +382,7 @@ def main() -> None:
                                 extra={
                                     "note": "result_already_exists",
                                     "last_worker_id": WORKER_ID,
+                                    "last_receive_count": receive_count,
                                 },
                             )
                         except Exception as e:
@@ -361,7 +404,6 @@ def main() -> None:
                     error_message=str(e),
                 )
 
-            # 2) Atomic claim
             try:
                 claimed, current_status = claim_job(job_id)
             except Exception as e:
@@ -382,6 +424,9 @@ def main() -> None:
                         receive_count=receive_count,
                         action="mark_failed_and_delete",
                     )
+                    put_metric("JobsFailed", 1)
+                    put_metric("JobsFailedPermanent", 1)
+
                     try:
                         ddb_set_status(
                             job_id,
@@ -515,6 +560,8 @@ def main() -> None:
                     result_key=result_key,
                     status="DONE",
                 )
+                put_metric("JobsProcessed", 1)
+                put_metric("JobDuration", duration, "Milliseconds")
 
             except Exception as e:
                 err = f"{type(e).__name__}: {e}"
@@ -528,6 +575,9 @@ def main() -> None:
                         error_message=err,
                         action="mark_failed_and_delete",
                     )
+                    put_metric("JobsFailed", 1)
+                    put_metric("JobsFailedPermanent", 1)
+
                     try:
                         ddb_set_status(
                             job_id,
@@ -559,6 +609,8 @@ def main() -> None:
                         error_message=err,
                         action="release_to_queued",
                     )
+                    put_metric("JobsFailed", 1)
+                    put_metric("JobsFailedTransient", 1)
                     ddb_release_to_queued(job_id, reason=err, receive_count=receive_count)
                     # DO NOT delete message => SQS retry / DLQ after threshold
 
