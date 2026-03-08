@@ -1,244 +1,312 @@
 Hybrid OCR Infrastructure
+Production-Inspired Asynchronous Processing System (AWS)
 
-A distributed OCR processing system designed to simulate production-grade asynchronous job processing using AWS primitives.
+==============================================================
 
-This project demonstrates how to build a reliable worker-based architecture with retry handling, failure classification, and dead-letter queue (DLQ) strategy.
+Overview
 
-The goal of this project is to practice system design concepts used in backend / DevOps / platform engineering roles.
+This project is a production-inspired asynchronous OCR processing system built using AWS S3, SQS, and DynamoDB.
 
-----------------------------------------------------------------------------------------------
+It demonstrates:
 
-Architecture Overview
+- Decoupled architecture
+- At-least-once delivery handling
+- Idempotent worker design
+- Conditional writes in DynamoDB
+- Failure-aware state transitions
+- Dockerized services
+- Local orchestration via Docker Compose
+
+--------------------------------------------------------------
+
+Architecture
+
+![Architecture](docs/architecture.png)
+
+Architecture Flow
+
 Client
-  ↓
-API (Flask / Gunicorn)
-  ↓
-S3 (store uploaded files)
-  ↓
-DynamoDB (source of truth for job state)
-  ↓
-SQS (job queue)
-  ↓
-Worker
-  ↓
-S3 (store OCR result)
+|
+v
+Flask API
+|
+|-- Upload file -> S3
+|-- Create job (QUEUED) -> DynamoDB
+|-- Send message -> SQS
+|
+v
+Worker (poll SQS)
+|
+|-- Process OCR
+|-- Upload result -> S3
+|-- Update job (DONE / FAILED) -> DynamoDB
+|-- Delete message -> SQS
 
-System components:
+Design principles:
 
--API – accepts file uploads and creates OCR jobs
--S3 – stores input documents and OCR results
--DynamoDB – tracks job state
--SQS – queues jobs for asynchronous processing
--Worker – processes jobs and performs OCR
+- DynamoDB is the source of truth
+- S3 stores input and result files
+- SQS provides async decoupling
+- Worker is idempotent
+- Safe against crash scenarios
 
-----------------------------------------------------------------------------------------------
+--------------------------------------------------------------
 
-Job Lifecycle
+Tech Stack
 
-Each job moves through a defined state machine:
+- Python 3.11
+- Flask
+- Gunicorn
+- boto3
+- AWS S3
+- AWS SQS
+- AWS DynamoDB
+- Docker
+- Docker Compose
 
-QUEUED
-  ↓
-PROCESSING
-  ↓
-DONE
+--------------------------------------------------------------
 
-Failure paths:
+Project Structure
 
-PROCESSING
-  ↓
-FAILED (permanent error)
+hybrid-ocr/
 
-or
+|-- hybrid-ocr-api/  
+|   |-- app.py  
+|   |-- Dockerfile  
+|   |-- requirements.txt  
 
-PROCESSING
-  ↓
-QUEUED (transient error → retry)
-  ↓
-DLQ (after maxReceiveCount)
+|-- hybrid-ocr-worker/  
+|   |-- aws_worker.py  
+|   |-- Dockerfile  
+|   |-- requirements.txt  
 
-----------------------------------------------------------------------------------------------
+|-- docs/  
+|   |-- architecture.png  
+|   |-- dashboard.png  
+|   |-- alarms.png  
 
-Failure Handling Strategy
+|-- docker-compose.yml  
+|-- .env.example  
+|-- README.md  
 
-The worker classifies failures into two categories.
+--------------------------------------------------------------
 
-Permanent Errors
+Environment Variables
 
-Examples:
+Create a `.env` file in the project root:
 
--Invalid input
--Corrupt files
--Logic errors
+OCR_API_KEY=changeme  
+OCR_S3_BUCKET=your-bucket-name  
+OCR_SQS_URL=https://sqs.ap-southeast-1.amazonaws.com/ACCOUNT_ID/queue-name  
+OCR_DDB_TABLE=your-ddb-table  
+AWS_REGION=ap-southeast-1  
 
-Behavior:
+--------------------------------------------------------------
 
-  PROCESSING → FAILED
-  SQS message deleted
+Running Locally
 
-----------------------------------------------------------------------------------------------
+Build and start both services:
 
-Transient Errors
+docker compose up --build
 
-Examples:
+API will be available at:
 
--Network timeouts
--Temporary AWS service errors
+http://localhost:8000
 
-Behavior:
+Health check:
 
-  PROCESSING → QUEUED
-  Message not deleted
-  SQS retries automatically
+curl http://localhost:8000/health
 
-If retries exceed maxReceiveCount, the message moves to the Dead Letter Queue (DLQ).
+--------------------------------------------------------------
 
-----------------------------------------------------------------------------------------------
+API Endpoints
 
-Idempotency
+Create Job
 
-The system implements idempotent job processing.
+POST /jobs
 
-If the result file already exists in S3:
+Header:
+x-api-key: <OCR_API_KEY>
 
-worker detects existing result
-→ skips processing
-→ deletes message
+Content-Type:
+multipart/form-data
 
-This prevents duplicate work when messages are retried.
-
-----------------------------------------------------------------------------------------------
-
-Local Development
-
-Run the system locally using Docker:
-
-  docker compose up --build
-
-API will start on:
-
-  http://localhost:8000
-
-----------------------------------------------------------------------------------------------
-
-Create a Job
-
-Upload a document:
-
-  curl -X POST http://localhost:8000/jobs   -H "x-api-key: changeme"   -F "file=@document.pdf"
+Field:
+file
 
 Response:
 
-  {
-    "job_id": "uuid",
-    "status": "QUEUED"
-  }
+{
+"job_id": "...",
+"status": "QUEUED"
+}
 
-----------------------------------------------------------------------------------------------
+--------------------------------------------------------------
 
-Worker Processing Flow
+Get Job Status
 
-Worker steps:
+GET /jobs/<job_id>
 
-1.Receive message from SQS
-2.Atomically claim job in DynamoDB
-3.Download input file from S3
-4.Run OCR
-5.Upload result to S3
-6.Update job status in DynamoDB
+Header:
+x-api-key: <OCR_API_KEY>
 
-----------------------------------------------------------------------------------------------
+Possible states:
 
-Test Scenarios
+- QUEUED
+- PROCESSING
+- DONE
+- FAILED
 
-The system was tested with three scenarios.
+If DONE, a presigned S3 download URL is returned.
 
-Success
-  QUEUED → PROCESSING → DONE
+--------------------------------------------------------------
 
-Permanent Failure
-  PROCESSING → FAILED
-  message deleted
+Failure Handling
 
-Transient Failure
-  PROCESSING → QUEUED
-  retry
-  DLQ after maxReceiveCount
+This system handles:
 
-----------------------------------------------------------------------------------------------
+- At-least-once delivery (SQS Standard)
+- Worker crash before delete_message
+- Crash after result upload but before DynamoDB update
+- Idempotent job execution
+
+DynamoDB conditional expressions prevent duplicate state transitions.
+
+--------------------------------------------------------------
 
 Observability
 
-The worker emits structured JSON logs for every important lifecycle event.
+CloudWatch Dashboard
 
-This allows logs to be easily consumed by systems such as:
--AWS CloudWatch
--ELK stack
--Datadog
--OpenTelemetry collectors
+![Dashboard](docs/dashboard.png)
 
-Example log event:
-{
-  "event": "job_claimed",
-  "ts": 1772895586088,
-  "worker_id": "e44958831c37",
-  "job_id": "60ba891b-7f39-40f1-9b43-833519f008ed",
-  "receive_count": 1,
-  "status": "PROCESSING"
-}
+The system includes basic observability using CloudWatch metrics and dashboards.
 
-Key lifecycle events emitted by the worker:
--message_received
--job_parsed
--job_claimed
--job_download_started
--job_download_finished
--job_processing_started
--job_upload_started
--job_done
--job_failed_permanent
--job_failed_transient
+Key metrics monitored:
 
-These logs make it possible to reconstruct the timeline of a job execution, which is useful for debugging, monitoring, and production observability.
+JobsProcessed  
+Number of successfully processed jobs.
 
-----------------------------------------------------------------------------------------------
+JobDuration  
+Processing latency.
 
-Technology Stack
+JobFailures  
+Number of failed jobs.
 
--Python
--Flask
--Docker
--AWS S3
--AWS SQS
--AWS DynamoDB
+QueueDepth  
+Number of messages waiting in the SQS queue.
 
-----------------------------------------------------------------------------------------------
+QueueAge  
+Age of the oldest message in the queue.
 
-Learning Goals
+DLQMessages  
+Number of messages in the Dead Letter Queue.
 
-This project focuses on understanding:
+These metrics help monitor system health and worker performance.
 
--distributed worker systems
--retry policies
--DLQ architecture
--idempotent processing
--atomic job claiming
--failure classification
+--------------------------------------------------------------
 
-----------------------------------------------------------------------------------------------
+CloudWatch Alarms
+
+![Alarms](docs/alarms.png)
+
+Configured alarms:
+
+HybridOCR-JobsFailed-High
+
+Triggers when job failures exceed a safe threshold.
+
+HybridOCR-QueueDepth-High
+
+Triggers when the queue grows beyond a defined limit.
+
+HybridOCR-DLQ-HasMessages
+
+Triggers when messages appear in the Dead Letter Queue.
+
+These alarms help detect operational issues early.
+
+--------------------------------------------------------------
+
+Runbook
+
+Operational checks for common issues.
+
+If jobs are not processing
+
+Check queue depth:
+
+CloudWatch → SQS → ApproximateNumberOfMessagesVisible
+
+If the queue keeps increasing, the worker may not be processing jobs.
+
+Check worker logs:
+
+CloudWatch → Logs
+
+Look for events such as:
+
+job_claimed  
+job_processing_started  
+job_done  
+job_failed  
+
+--------------------------------------------------------------
+
+If jobs are failing
+
+Check the JobFailures metric in CloudWatch.
+
+Steps:
+
+1. Inspect worker logs.
+2. Identify error_code values.
+3. Verify input files exist in S3.
+4. Check DynamoDB job state.
+
+Permanent failures should set job status to FAILED.
+
+--------------------------------------------------------------
+
+If messages appear in DLQ
+
+Check the DLQ queue.
+
+Steps:
+
+1. Inspect the failed message.
+2. Review worker logs around the failure timestamp.
+3. Identify the root cause.
+4. Reprocess the job if appropriate.
+
+--------------------------------------------------------------
+
+Engineering Concepts Demonstrated
+
+- Asynchronous processing
+- Decoupled architecture
+- Message-driven systems
+- Visibility timeout awareness
+- Idempotent design
+- Production-style containerization
+- Observability with metrics and alarms
+
+--------------------------------------------------------------
 
 Future Improvements
 
-Planned improvements:
+- Terraform (Infrastructure as Code)
+- CI/CD pipeline (GitHub Actions)
+- Structured logging
+- Retry state handling
+- Dead-letter queue automation
+- Metrics and monitoring improvements
 
--structured JSON logging
--CloudWatch metrics and alarms
--Terraform infrastructure provisioning
--worker autoscaling
--Kubernetes deployment
-
-----------------------------------------------------------------------------------------------
+--------------------------------------------------------------
 
 Author
 
 Anurinth Wichairum
+
+Cloud / DevOps Engineer (Aspiring)
+
