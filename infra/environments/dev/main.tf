@@ -31,3 +31,12 @@ module "dynamodb" {
   enable_pitr  = true
   common_tags  = module.labels.common_tags
 }
+
+module "iam" {
+  source             = "../../modules/iam"
+  project_prefix     = module.labels.prefix
+  s3_bucket_arn      = module.s3.bucket_arn
+  sqs_queue_arn      = module.sqs.queue_arn
+  dynamodb_table_arn = module.dynamodb.table_arn
+  common_tags        = module.labels.common_tags
+}

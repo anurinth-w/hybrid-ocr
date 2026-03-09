@@ -29,3 +29,11 @@ output "dynamodb_table_name" {
 output "dynamodb_table_arn" {
   value = module.dynamodb.table_arn
 }
+
+output "api_policy_arn" {
+  value = module.iam.api_policy_arn
+}
+
+output "worker_policy_arn" {
+  value = module.iam.worker_policy_arn
+}
