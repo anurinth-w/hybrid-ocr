@@ -31,3 +31,10 @@ env/
 
 # Docker
 *.tar
+
+# Terraform
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+crash.log
+*.tfvars

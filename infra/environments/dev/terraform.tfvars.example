@@ -1,0 +1,8 @@
+project                    = "hybrid-ocr"
+environment                = "dev"
+aws_region                 = "ap-southeast-1"
+bucket_force_destroy       = true
+visibility_timeout_seconds = 120
+message_retention_seconds  = 345600
+receive_wait_time_seconds  = 10
+max_receive_count          = 3
