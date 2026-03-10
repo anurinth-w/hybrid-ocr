@@ -52,6 +52,19 @@ Design principles:
 
 --------------------------------------------------------------
 
+## CI/CD
+
+This repository uses GitHub Actions to automate core validation checks.
+
+Current workflows:
+- **Terraform CI**: runs `terraform fmt -check`, `terraform init -backend=false`, and `terraform validate` for the dev environment
+- **Docker CI**: builds Docker images for `hybrid-ocr-api` and `hybrid-ocr-worker`
+- **Python CI**: installs dependencies and compiles Python files for both services to catch syntax issues early
+
+These workflows help ensure infrastructure and application changes remain valid before deployment.
+
+--------------------------------------------------------------
+
 Tech Stack
 
 - Python 3.11
