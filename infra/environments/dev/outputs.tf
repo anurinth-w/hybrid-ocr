@@ -37,3 +37,19 @@ output "api_policy_arn" {
 output "worker_policy_arn" {
   value = module.iam.worker_policy_arn
 }
+
+output "api_repository_name" {
+  value = module.ecr.api_repository_name
+}
+
+output "api_repository_url" {
+  value = module.ecr.api_repository_url
+}
+
+output "worker_repository_name" {
+  value = module.ecr.worker_repository_name
+}
+
+output "worker_repository_url" {
+  value = module.ecr.worker_repository_url
+}

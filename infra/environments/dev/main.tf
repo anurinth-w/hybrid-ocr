@@ -40,3 +40,10 @@ module "iam" {
   dynamodb_table_arn = module.dynamodb.table_arn
   common_tags        = module.labels.common_tags
 }
+
+module "ecr" {
+  source                 = "../../modules/ecr"
+  api_repository_name    = "${module.labels.prefix}-api"
+  worker_repository_name = "${module.labels.prefix}-worker"
+  common_tags            = module.labels.common_tags
+}
