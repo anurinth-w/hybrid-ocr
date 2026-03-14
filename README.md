@@ -52,16 +52,33 @@ Design principles:
 
 --------------------------------------------------------------
 
-## CI/CD
+## CI/CD Pipeline
 
-This repository uses GitHub Actions to automate core validation checks.
+This project uses GitHub Actions for CI/CD.
 
-Current workflows:
-- **Terraform CI**: runs `terraform fmt -check`, `terraform init -backend=false`, and `terraform validate` for the dev environment
-- **Docker CI**: builds Docker images for `hybrid-ocr-api` and `hybrid-ocr-worker`
-- **Python CI**: installs dependencies and compiles Python files for both services to catch syntax issues early
+### CI
 
-These workflows help ensure infrastructure and application changes remain valid before deployment.
+On pull requests:
+
+- Python validation (API and Worker)
+- Docker build validation
+- Terraform validation
+
+### CD
+
+On push to `main`:
+
+1. GitHub Actions assumes an AWS IAM role using **OIDC**
+2. Builds Docker images for:
+   - `hybrid-ocr-api`
+   - `hybrid-ocr-worker`
+3. Pushes images to **Amazon ECR**
+
+### Security
+
+AWS authentication is performed using **GitHub OIDC** instead of static credentials.
+
+No AWS access keys are stored in GitHub secrets.
 
 --------------------------------------------------------------
 
