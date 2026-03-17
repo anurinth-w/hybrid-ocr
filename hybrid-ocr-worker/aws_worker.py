@@ -16,7 +16,6 @@ from botocore.exceptions import (
 AWS_REGION = os.getenv("AWS_REGION", "ap-southeast-1")
 SQS_URL = os.getenv("OCR_SQS_URL")
 DDB_TABLE = os.getenv("OCR_DDB_TABLE")
-
 WORKER_ID = socket.gethostname()
 
 # Tuning knobs
@@ -31,6 +30,7 @@ CW_NAMESPACE = os.getenv("CW_NAMESPACE", "HybridOCR")
 CW_SERVICE_DIMENSION = os.getenv("CW_SERVICE_DIMENSION", "HybridOCRWorker")
 
 session = boto3.session.Session(region_name=AWS_REGION)
+
 s3 = session.client("s3")
 sqs = session.client("sqs")
 ddb = session.client("dynamodb")
@@ -41,10 +41,18 @@ def now_ms() -> int:
     return int(time.time() * 1000)
 
 
+def safe_int(value: Any, default: Optional[int] = None) -> Optional[int]:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def log_event(event: str, **fields: Any) -> None:
     payload = {
         "event": event,
         "ts": now_ms(),
+        "service": "worker",
         "worker_id": WORKER_ID,
         **fields,
     }
@@ -91,7 +99,6 @@ def put_metric(
 # -------------------------
 # DynamoDB helpers
 # -------------------------
-
 def ddb_get_status(job_id: str) -> Optional[str]:
     """Return status string if item exists, else None."""
     resp = ddb.get_item(
@@ -109,8 +116,7 @@ def ddb_get_status(job_id: str) -> Optional[str]:
 
 def claim_job(job_id: str) -> Tuple[bool, Optional[str]]:
     """
-    Atomic claim:
-      QUEUED -> PROCESSING
+    Atomic claim: QUEUED -> PROCESSING
     Return (claimed_ok, current_status_if_known)
     """
     t = now_ms()
@@ -147,6 +153,7 @@ def ddb_set_status(job_id: str, new_status: str, *, extra: Optional[Dict[str, An
     Does NOT overwrite worker_id by default.
     """
     extra = extra or {}
+
     expr = "SET #s=:s, updated_at=:u"
     names = {"#s": "status"}
     vals: Dict[str, Dict[str, Any]] = {
@@ -178,8 +185,7 @@ def ddb_set_status(job_id: str, new_status: str, *, extra: Optional[Dict[str, An
 
 def ddb_release_to_queued(job_id: str, *, reason: str, receive_count: int) -> None:
     """
-    On transient error:
-      PROCESSING -> QUEUED
+    On transient error: PROCESSING -> QUEUED
     """
     if not TRANSIENT_RELEASE_TO_QUEUED:
         return
@@ -214,7 +220,6 @@ def ddb_release_to_queued(job_id: str, *, reason: str, receive_count: int) -> No
 # -------------------------
 # S3 helpers
 # -------------------------
-
 def s3_object_exists(bucket: str, key: str) -> bool:
     try:
         s3.head_object(Bucket=bucket, Key=key)
@@ -229,28 +234,23 @@ def s3_object_exists(bucket: str, key: str) -> bool:
 # -------------------------
 # Error classification
 # -------------------------
-
 def is_permanent_error(exc: Exception) -> bool:
     if isinstance(exc, RuntimeError) and "PermanentTest" in str(exc):
         return True
-
     if isinstance(exc, ClientError):
         code = exc.response.get("Error", {}).get("Code", "")
         if code in ("NoSuchKey", "NotFound", "404"):
             return True
         if code in ("AccessDenied", "InvalidAccessKeyId", "SignatureDoesNotMatch"):
             return True
-
     return False
 
 
 def is_transient_error(exc: Exception) -> bool:
     if isinstance(exc, RuntimeError) and "TransientTest" in str(exc):
         return True
-
     if isinstance(exc, (EndpointConnectionError, ConnectionClosedError, ReadTimeoutError)):
         return True
-
     if isinstance(exc, ClientError):
         code = exc.response.get("Error", {}).get("Code", "")
         if code in (
@@ -265,14 +265,12 @@ def is_transient_error(exc: Exception) -> bool:
             return True
         if code in ("SlowDown",) or code.startswith("5"):
             return True
-
     return False
 
 
 # -------------------------
 # OCR (dummy)
 # -------------------------
-
 def dummy_ocr(local_in_path: Path) -> Dict[str, Any]:
     size = local_in_path.stat().st_size if local_in_path.exists() else 0
     return {"text": "dummy", "pages": 1, "input_size_bytes": size}
@@ -281,7 +279,6 @@ def dummy_ocr(local_in_path: Path) -> Dict[str, Any]:
 # -------------------------
 # Worker loop
 # -------------------------
-
 def main() -> None:
     if not (SQS_URL and DDB_TABLE):
         raise SystemExit("Missing env: OCR_SQS_URL and/or OCR_DDB_TABLE")
@@ -303,7 +300,6 @@ def main() -> None:
             WaitTimeSeconds=LONG_POLL_SECONDS,
             AttributeNames=["ApproximateReceiveCount"],
         )
-
         msgs = resp.get("Messages", [])
         if not msgs:
             continue
@@ -315,7 +311,7 @@ def main() -> None:
             receive_count = int(attrs.get("ApproximateReceiveCount", "1"))
 
             log_event(
-                "message_received",
+                "job_received",
                 receive_count=receive_count,
                 body_preview=raw_body[:200],
             )
@@ -341,6 +337,7 @@ def main() -> None:
             input_key = body.get("input_key")
             result_key = body.get("result_key")
             force_error = body.get("force_error")
+            created_at = safe_int(body.get("created_at"))
 
             if not (job_id and bucket and input_key and result_key):
                 log_event(
@@ -360,6 +357,7 @@ def main() -> None:
                 result_key=result_key,
                 receive_count=receive_count,
                 force_error=force_error,
+                created_at=created_at,
             )
 
             try:
@@ -376,11 +374,19 @@ def main() -> None:
 
                     if MARK_DONE_IF_RESULT_EXISTS:
                         try:
+                            done_at = now_ms()
+                            end_to_end_latency_ms = None
+                            if created_at is not None:
+                                end_to_end_latency_ms = max(0, done_at - created_at)
+                                put_metric("EndToEndLatencyMs", end_to_end_latency_ms, "Milliseconds")
+
                             ddb_set_status(
                                 job_id,
                                 "DONE",
                                 extra={
                                     "note": "result_already_exists",
+                                    "done_at": done_at,
+                                    "end_to_end_latency_ms": end_to_end_latency_ms,
                                     "last_worker_id": WORKER_ID,
                                     "last_receive_count": receive_count,
                                 },
@@ -392,8 +398,16 @@ def main() -> None:
                                 error_type=type(e).__name__,
                                 error_message=str(e),
                             )
+
                     sqs.delete_message(QueueUrl=SQS_URL, ReceiptHandle=receipt)
+                    log_event(
+                        "job_deleted_from_queue",
+                        job_id=job_id,
+                        receive_count=receive_count,
+                        reason="result_already_exists",
+                    )
                     continue
+
             except Exception as e:
                 log_event(
                     "result_exists_check_failed",
@@ -426,7 +440,6 @@ def main() -> None:
                     )
                     put_metric("JobsFailed", 1)
                     put_metric("JobsFailedPermanent", 1)
-
                     try:
                         ddb_set_status(
                             job_id,
@@ -447,6 +460,12 @@ def main() -> None:
                             error_message=str(e),
                         )
                     sqs.delete_message(QueueUrl=SQS_URL, ReceiptHandle=receipt)
+                    log_event(
+                        "job_deleted_from_queue",
+                        job_id=job_id,
+                        receive_count=receive_count,
+                        reason="missing_ddb_item",
+                    )
                     continue
 
                 if current_status in ("DONE", "FAILED"):
@@ -457,6 +476,12 @@ def main() -> None:
                         receive_count=receive_count,
                     )
                     sqs.delete_message(QueueUrl=SQS_URL, ReceiptHandle=receipt)
+                    log_event(
+                        "job_deleted_from_queue",
+                        job_id=job_id,
+                        receive_count=receive_count,
+                        reason=f"not_claimable_{current_status}",
+                    )
                     continue
 
                 log_event(
@@ -482,11 +507,20 @@ def main() -> None:
                     )
                 continue
 
+            processing_started_at = now_ms()
+            queue_delay_ms = None
+            if created_at is not None:
+                queue_delay_ms = max(0, processing_started_at - created_at)
+                put_metric("QueueDelayMs", queue_delay_ms, "Milliseconds")
+
             log_event(
                 "job_claimed",
                 job_id=job_id,
                 receive_count=receive_count,
                 status="PROCESSING",
+                created_at=created_at,
+                processing_started_at=processing_started_at,
+                queue_delay_ms=queue_delay_ms,
             )
 
             local_in = Path(f"/tmp/{job_id}.bin")
@@ -515,15 +549,27 @@ def main() -> None:
                     local_path=str(local_in),
                 )
 
-                t0 = now_ms()
-                log_event("job_processing_started", job_id=job_id, receive_count=receive_count)
+                log_event(
+                    "job_processing_started",
+                    job_id=job_id,
+                    receive_count=receive_count,
+                )
+
+                ocr_started_at = now_ms()
+
+
+                # simulate realistice OCR processing time
+                OCR_SIMULATION_SECONDS = int(os.getenv("OCR_SIMULATION_SECONDS", "20"))
+                time.sleep(OCR_SIMULATION_SECONDS)
+
                 result = dummy_ocr(local_in)
-                duration = now_ms() - t0
+                ocr_finished_at = now_ms()
+                ocr_duration_ms = max(0, ocr_finished_at - ocr_started_at)
 
                 payload = {
                     "job_id": job_id,
                     "status": "DONE",
-                    "duration_ms": duration,
+                    "duration_ms": ocr_duration_ms,
                     "result": result,
                 }
                 local_out.write_text(
@@ -537,42 +583,66 @@ def main() -> None:
                     bucket=bucket,
                     result_key=result_key,
                     receive_count=receive_count,
-                    duration_ms=duration,
+                    ocr_duration_ms=ocr_duration_ms,
                 )
                 s3.upload_file(str(local_out), bucket, result_key)
+
+                done_at = now_ms()
+                processing_latency_ms = max(0, done_at - processing_started_at)
+                put_metric("ProcessingLatencyMs", processing_latency_ms, "Milliseconds")
+
+                end_to_end_latency_ms = None
+                if created_at is not None:
+                    end_to_end_latency_ms = max(0, done_at - created_at)
+                    put_metric("EndToEndLatencyMs", end_to_end_latency_ms, "Milliseconds")
 
                 ddb_set_status(
                     job_id,
                     "DONE",
                     extra={
-                        "duration_ms": duration,
+                        "duration_ms": ocr_duration_ms,
+                        "done_at": done_at,
+                        "processing_latency_ms": processing_latency_ms,
+                        "end_to_end_latency_ms": end_to_end_latency_ms,
                         "last_worker_id": WORKER_ID,
                         "last_receive_count": receive_count,
                     },
                 )
-                sqs.delete_message(QueueUrl=SQS_URL, ReceiptHandle=receipt)
 
+                sqs.delete_message(QueueUrl=SQS_URL, ReceiptHandle=receipt)
                 log_event(
-                    "job_done",
+                    "job_deleted_from_queue",
                     job_id=job_id,
                     receive_count=receive_count,
-                    duration_ms=duration,
-                    result_key=result_key,
-                    status="DONE",
+                    reason="job_done",
                 )
+
+                log_event(
+                    "job_processing_completed",
+                    job_id=job_id,
+                    receive_count=receive_count,
+                    status="DONE",
+                    result_key=result_key,
+                    queue_delay_ms=queue_delay_ms,
+                    ocr_duration_ms=ocr_duration_ms,
+                    processing_latency_ms=processing_latency_ms,
+                    end_to_end_latency_ms=end_to_end_latency_ms,
+                )
+
                 put_metric("JobsProcessed", 1)
-                put_metric("JobDuration", duration, "Milliseconds")
+                put_metric("JobDuration", ocr_duration_ms, "Milliseconds")
 
             except Exception as e:
                 err = f"{type(e).__name__}: {e}"
 
                 if is_permanent_error(e) and not is_transient_error(e):
                     log_event(
-                        "job_failed_permanent",
+                        "job_failed",
                         job_id=job_id,
                         receive_count=receive_count,
                         error_code="PermanentError",
                         error_message=err,
+                        failure_type="PERMANENT",
                         action="mark_failed_and_delete",
                     )
                     put_metric("JobsFailed", 1)
@@ -598,15 +668,23 @@ def main() -> None:
                             error_type=type(update_err).__name__,
                             error_message=str(update_err),
                         )
+
                     sqs.delete_message(QueueUrl=SQS_URL, ReceiptHandle=receipt)
+                    log_event(
+                        "job_deleted_from_queue",
+                        job_id=job_id,
+                        receive_count=receive_count,
+                        reason="permanent_failure",
+                    )
 
                 else:
                     log_event(
-                        "job_failed_transient",
+                        "job_failed",
                         job_id=job_id,
                         receive_count=receive_count,
                         error_code="TransientError",
                         error_message=err,
+                        failure_type="TRANSIENT",
                         action="release_to_queued",
                     )
                     put_metric("JobsFailed", 1)
@@ -624,7 +702,6 @@ def main() -> None:
                         error_type=type(e).__name__,
                         error_message=str(e),
                     )
-
                 try:
                     local_out.unlink(missing_ok=True)
                 except Exception as e:
