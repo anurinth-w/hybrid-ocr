@@ -1,40 +1,103 @@
 # app.py
-import os, uuid, time, json
+
+import os
+import uuid
+import time
+import json
+from typing import Any
+
 from flask import Flask, request, jsonify
+
 import boto3
 from botocore.exceptions import ClientError
 
 app = Flask(__name__)
 
 API_KEY = os.getenv("OCR_API_KEY", "")
+
 S3_BUCKET = os.getenv("OCR_S3_BUCKET")
 SQS_URL = os.getenv("OCR_SQS_URL")
 DDB_TABLE = os.getenv("OCR_DDB_TABLE")
 AWS_REGION = os.getenv("AWS_REGION")
 
+CW_NAMESPACE = os.getenv("CW_NAMESPACE", "HybridOCR")
+CW_SERVICE_DIMENSION = os.getenv("CW_SERVICE_DIMENSION", "HybridOCRAPI")
+
 session = boto3.session.Session(region_name=AWS_REGION)
+
 s3 = session.client("s3")
 sqs = session.client("sqs")
 ddb = session.client("dynamodb")
+cw = session.client("cloudwatch")
 
-def now_ms(): return int(time.time() * 1000)
 
-def require_api_key(req):
-    # ถ้าไม่ได้ตั้ง API_KEY ให้ปิดระบบไปเลย
+def now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def log_event(event: str, **fields: Any) -> None:
+    payload = {
+        "event": event,
+        "ts": now_ms(),
+        "service": "api",
+        **fields,
+    }
+    print(json.dumps(payload, ensure_ascii=False), flush=True)
+
+
+def put_metric(
+    name: str,
+    value: float,
+    unit: str = "Count",
+) -> None:
+    dimensions = [
+        {"Name": "Service", "Value": CW_SERVICE_DIMENSION},
+    ]
+
+    try:
+        cw.put_metric_data(
+            Namespace=CW_NAMESPACE,
+            MetricData=[
+                {
+                    "MetricName": name,
+                    "Value": value,
+                    "Unit": unit,
+                    "Dimensions": dimensions,
+                    "Timestamp": int(time.time()),
+                }
+            ],
+        )
+    except Exception as e:
+        log_event(
+            "cloudwatch_metric_error",
+            metric_name=name,
+            metric_value=value,
+            metric_unit=unit,
+            error_type=type(e).__name__,
+            error_message=str(e),
+        )
+
+
+def require_api_key(req) -> bool:
     if not API_KEY:
         return False
     return req.headers.get("x-api-key", "") == API_KEY
+
 
 def validate_file(f):
     allowed = {"application/pdf", "image/png", "image/jpeg"}
     if f.mimetype not in allowed:
         return False, f"unsupported content-type: {f.mimetype}"
+
     f.seek(0, 2)
     size = f.tell()
     f.seek(0)
+
     if size > 25 * 1024 * 1024:
         return False, "file too large (max 25MB)"
+
     return True, None
+
 
 @app.post("/jobs")
 def create_job():
@@ -58,10 +121,26 @@ def create_job():
     result_key = f"results/{job_id}/result.json"
     ts = now_ms()
 
+    log_event(
+        "job_create_requested",
+        job_id=job_id,
+        filename=filename,
+        content_type=f.mimetype,
+        created_at=ts,
+    )
+
     # 1) upload to S3
     try:
         s3.upload_fileobj(f, S3_BUCKET, input_key)
     except ClientError as e:
+        put_metric("JobCreateFailures", 1)
+        log_event(
+            "job_create_failed",
+            job_id=job_id,
+            status="FAILED",
+            error_type="S3UploadFailed",
+            error_message=str(e),
+        )
         return jsonify({"error": "s3 upload failed", "detail": str(e)}), 500
 
     # 2) put DynamoDB (QUEUED)
@@ -78,22 +157,36 @@ def create_job():
                 "created_at": {"N": str(ts)},
                 "updated_at": {"N": str(ts)},
             },
-            ConditionExpression="attribute_not_exists(job_id)"
+            ConditionExpression="attribute_not_exists(job_id)",
         )
     except ClientError as e:
-        # cleanup: ลบไฟล์ที่อัปขึ้น S3 ไปแล้ว
         try:
             s3.delete_object(Bucket=S3_BUCKET, Key=input_key)
         except Exception:
             pass
+
+        put_metric("JobCreateFailures", 1)
+        log_event(
+            "job_create_failed",
+            job_id=job_id,
+            status="FAILED",
+            error_type="DDBPutFailed",
+            error_message=str(e),
+        )
         return jsonify({"error": "ddb put failed", "detail": str(e)}), 500
 
     # 3) send SQS
-    msg = {"job_id": job_id, "bucket": S3_BUCKET, "input_key": input_key, "result_key": result_key, "created_at": ts}
+    msg = {
+        "job_id": job_id,
+        "bucket": S3_BUCKET,
+        "input_key": input_key,
+        "result_key": result_key,
+        "created_at": ts,
+    }
+
     try:
         sqs.send_message(QueueUrl=SQS_URL, MessageBody=json.dumps(msg))
     except ClientError as e:
-        # mark FAILED เพราะไม่เข้าคิว
         ddb.update_item(
             TableName=DDB_TABLE,
             Key={"job_id": {"S": job_id}},
@@ -103,11 +196,31 @@ def create_job():
                 ":s": {"S": "FAILED"},
                 ":e": {"S": f"sqs send failed: {e}"},
                 ":u": {"N": str(now_ms())},
-            }
+            },
+        )
+
+        put_metric("JobCreateFailures", 1)
+        log_event(
+            "job_create_failed",
+            job_id=job_id,
+            status="FAILED",
+            error_type="SQSSendFailed",
+            error_message=str(e),
         )
         return jsonify({"error": "sqs send failed", "job_id": job_id}), 500
 
+    put_metric("JobsCreated", 1)
+    log_event(
+        "job_created",
+        job_id=job_id,
+        status="QUEUED",
+        input_s3_key=input_key,
+        result_s3_key=result_key,
+        created_at=ts,
+    )
+
     return jsonify({"job_id": job_id, "status": "QUEUED"}), 201
+
 
 @app.get("/jobs/<job_id>")
 def get_job(job_id):
@@ -132,14 +245,16 @@ def get_job(job_id):
         out["result_download_url"] = s3.generate_presigned_url(
             "get_object",
             Params={"Bucket": S3_BUCKET, "Key": out["result_s3_key"]},
-            ExpiresIn=3600
+            ExpiresIn=3600,
         )
+
     return jsonify(out), 200
+
 
 @app.get("/health")
 def health():
     return jsonify({"ok": True}), 200
 
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000)
-
