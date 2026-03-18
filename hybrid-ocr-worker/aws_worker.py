@@ -2,10 +2,13 @@ import os
 import json
 import time
 import socket
+import threading
+import subprocess
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 import boto3
+import psutil
 from botocore.exceptions import (
     ClientError,
     EndpointConnectionError,
@@ -24,6 +27,10 @@ MAX_MESSAGES = int(os.getenv("WORKER_MAX_MESSAGES", "1"))
 CLAIM_FAIL_VISIBILITY_DELAY = int(os.getenv("WORKER_CLAIM_FAIL_VIS_DELAY", "30"))  # seconds
 TRANSIENT_RELEASE_TO_QUEUED = os.getenv("WORKER_TRANSIENT_RELEASE_TO_QUEUED", "1") == "1"
 MARK_DONE_IF_RESULT_EXISTS = os.getenv("WORKER_MARK_DONE_IF_RESULT_EXISTS", "1") == "1"
+
+# OCR simulation / heartbeat
+OCR_SIMULATION_SECONDS = int(os.getenv("OCR_SIMULATION_SECONDS", "20"))
+WORKER_HEARTBEAT_SECONDS = int(os.getenv("WORKER_HEARTBEAT_SECONDS", "60"))
 
 # CloudWatch metrics
 CW_NAMESPACE = os.getenv("CW_NAMESPACE", "HybridOCR")
@@ -96,6 +103,85 @@ def put_metric(
         )
 
 
+def get_gpu_metrics() -> tuple[Optional[float], Optional[float]]:
+    """
+    Returns:
+        (gpu_util_percent, gpu_memory_percent)
+
+    Reads first GPU from nvidia-smi output.
+    If nvidia-smi is unavailable or GPU is not exposed to the container,
+    returns (None, None).
+    """
+    try:
+        result = subprocess.check_output(
+            [
+                "nvidia-smi",
+                "--query-gpu=utilization.gpu,memory.used,memory.total",
+                "--format=csv,noheader,nounits",
+            ],
+            encoding="utf-8",
+            stderr=subprocess.DEVNULL,
+        ).strip()
+
+        if not result:
+            return None, None
+
+        first_line = result.splitlines()[0]
+        parts = [p.strip() for p in first_line.split(",")]
+        if len(parts) != 3:
+            return None, None
+
+        gpu_util = float(parts[0])
+        mem_used = float(parts[1])
+        mem_total = float(parts[2])
+
+        gpu_mem_percent = (mem_used / mem_total) * 100 if mem_total > 0 else 0.0
+        return gpu_util, gpu_mem_percent
+    except Exception:
+        return None, None
+
+
+def start_heartbeat(interval_sec: int = 60) -> None:
+    def loop() -> None:
+        while True:
+            try:
+                put_metric("WorkerHeartbeat", 1)
+
+                cpu = psutil.cpu_percent(interval=None)
+                mem = psutil.virtual_memory().percent
+
+                put_metric("CPUUsagePercent", cpu, "Percent")
+                put_metric("MemoryUsagePercent", mem, "Percent")
+
+                gpu_util, gpu_mem_percent = get_gpu_metrics()
+
+                if gpu_util is not None:
+                    put_metric("GPUUsagePercent", gpu_util, "Percent")
+
+                if gpu_mem_percent is not None:
+                    put_metric("GPUMemoryUsagePercent", gpu_mem_percent, "Percent")
+
+                log_event(
+                    "worker_heartbeat",
+                    cpu_usage_percent=cpu,
+                    memory_usage_percent=mem,
+                    gpu_usage_percent=gpu_util,
+                    gpu_memory_usage_percent=gpu_mem_percent,
+                    heartbeat_interval_sec=interval_sec,
+                )
+            except Exception as e:
+                log_event(
+                    "worker_heartbeat_error",
+                    error_type=type(e).__name__,
+                    error_message=str(e),
+                )
+
+            time.sleep(interval_sec)
+
+    t = threading.Thread(target=loop, daemon=True)
+    t.start()
+
+
 # -------------------------
 # DynamoDB helpers
 # -------------------------
@@ -148,10 +234,6 @@ def claim_job(job_id: str) -> Tuple[bool, Optional[str]]:
 
 
 def ddb_set_status(job_id: str, new_status: str, *, extra: Optional[Dict[str, Any]] = None) -> None:
-    """
-    General status update.
-    Does NOT overwrite worker_id by default.
-    """
     extra = extra or {}
 
     expr = "SET #s=:s, updated_at=:u"
@@ -170,7 +252,7 @@ def ddb_set_status(job_id: str, new_status: str, *, extra: Optional[Dict[str, An
         elif isinstance(v, bool):
             vals[f":{k}"] = {"BOOL": v}
         elif isinstance(v, (int, float)):
-            vals[f":{k}"] = {"N": str(int(v))}
+            vals[f":{k}"] = {"N": str(v)}
         else:
             vals[f":{k}"] = {"S": json.dumps(v, ensure_ascii=False)}
 
@@ -184,9 +266,6 @@ def ddb_set_status(job_id: str, new_status: str, *, extra: Optional[Dict[str, An
 
 
 def ddb_release_to_queued(job_id: str, *, reason: str, receive_count: int) -> None:
-    """
-    On transient error: PROCESSING -> QUEUED
-    """
     if not TRANSIENT_RELEASE_TO_QUEUED:
         return
 
@@ -291,7 +370,11 @@ def main() -> None:
         long_poll_seconds=LONG_POLL_SECONDS,
         max_messages=MAX_MESSAGES,
         cw_namespace=CW_NAMESPACE,
+        ocr_simulation_seconds=OCR_SIMULATION_SECONDS,
+        worker_heartbeat_seconds=WORKER_HEARTBEAT_SECONDS,
     )
+
+    start_heartbeat(WORKER_HEARTBEAT_SECONDS)
 
     while True:
         resp = sqs.receive_message(
@@ -557,12 +640,11 @@ def main() -> None:
 
                 ocr_started_at = now_ms()
 
-
-                # simulate realistice OCR processing time
-                OCR_SIMULATION_SECONDS = int(os.getenv("OCR_SIMULATION_SECONDS", "20"))
-                time.sleep(OCR_SIMULATION_SECONDS)
+                if OCR_SIMULATION_SECONDS > 0:
+                    time.sleep(OCR_SIMULATION_SECONDS)
 
                 result = dummy_ocr(local_in)
+
                 ocr_finished_at = now_ms()
                 ocr_duration_ms = max(0, ocr_finished_at - ocr_started_at)
 
@@ -584,6 +666,7 @@ def main() -> None:
                     result_key=result_key,
                     receive_count=receive_count,
                     ocr_duration_ms=ocr_duration_ms,
+                    ocr_simulation_seconds=OCR_SIMULATION_SECONDS,
                 )
                 s3.upload_file(str(local_out), bucket, result_key)
 
