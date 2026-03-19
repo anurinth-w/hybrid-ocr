@@ -61,6 +61,8 @@ def log_event(event: str, **fields: Any) -> None:
         "ts": now_ms(),
         "service": "worker",
         "worker_id": WORKER_ID,
+        "trace_id": fields.get("trace_id"),
+        "job_id": fields.get("job_id"),
         **fields,
     }
     print(json.dumps(payload, ensure_ascii=False), flush=True)
@@ -434,6 +436,7 @@ def main() -> None:
 
             log_event(
                 "job_parsed",
+                trace_id=job_id,
                 job_id=job_id,
                 bucket=bucket,
                 input_key=input_key,
@@ -447,6 +450,7 @@ def main() -> None:
                 if s3_object_exists(bucket, result_key):
                     log_event(
                         "job_result_exists",
+                        trace_id=job_id,
                         job_id=job_id,
                         bucket=bucket,
                         result_key=result_key,
@@ -477,6 +481,7 @@ def main() -> None:
                         except Exception as e:
                             log_event(
                                 "ddb_mark_done_if_result_exists_failed",
+    trace_id=job_id,
                                 job_id=job_id,
                                 error_type=type(e).__name__,
                                 error_message=str(e),
@@ -485,6 +490,7 @@ def main() -> None:
                     sqs.delete_message(QueueUrl=SQS_URL, ReceiptHandle=receipt)
                     log_event(
                         "job_deleted_from_queue",
+    trace_id=job_id,
                         job_id=job_id,
                         receive_count=receive_count,
                         reason="result_already_exists",
@@ -494,6 +500,7 @@ def main() -> None:
             except Exception as e:
                 log_event(
                     "result_exists_check_failed",
+    trace_id=job_id,
                     job_id=job_id,
                     bucket=bucket,
                     result_key=result_key,
@@ -506,6 +513,7 @@ def main() -> None:
             except Exception as e:
                 log_event(
                     "job_claim_error",
+    trace_id=job_id,
                     job_id=job_id,
                     receive_count=receive_count,
                     error_type=type(e).__name__,
@@ -517,6 +525,7 @@ def main() -> None:
                 if current_status is None:
                     log_event(
                         "job_missing_in_ddb_deleted",
+    trace_id=job_id,
                         job_id=job_id,
                         receive_count=receive_count,
                         action="mark_failed_and_delete",
@@ -538,6 +547,7 @@ def main() -> None:
                     except Exception as e:
                         log_event(
                             "ddb_mark_missing_job_failed_error",
+    trace_id=job_id,
                             job_id=job_id,
                             error_type=type(e).__name__,
                             error_message=str(e),
@@ -545,6 +555,7 @@ def main() -> None:
                     sqs.delete_message(QueueUrl=SQS_URL, ReceiptHandle=receipt)
                     log_event(
                         "job_deleted_from_queue",
+    trace_id=job_id,
                         job_id=job_id,
                         receive_count=receive_count,
                         reason="missing_ddb_item",
@@ -554,6 +565,7 @@ def main() -> None:
                 if current_status in ("DONE", "FAILED"):
                     log_event(
                         "job_not_claimable_deleted",
+    trace_id=job_id,
                         job_id=job_id,
                         current_status=current_status,
                         receive_count=receive_count,
@@ -561,6 +573,7 @@ def main() -> None:
                     sqs.delete_message(QueueUrl=SQS_URL, ReceiptHandle=receipt)
                     log_event(
                         "job_deleted_from_queue",
+    trace_id=job_id,
                         job_id=job_id,
                         receive_count=receive_count,
                         reason=f"not_claimable_{current_status}",
@@ -569,6 +582,7 @@ def main() -> None:
 
                 log_event(
                     "job_not_claimable_visibility_changed",
+    trace_id=job_id,
                     job_id=job_id,
                     current_status=current_status,
                     receive_count=receive_count,
@@ -583,6 +597,7 @@ def main() -> None:
                 except Exception as e:
                     log_event(
                         "change_visibility_failed",
+    trace_id=job_id,
                         job_id=job_id,
                         receive_count=receive_count,
                         error_type=type(e).__name__,
@@ -598,6 +613,7 @@ def main() -> None:
 
             log_event(
                 "job_claimed",
+                trace_id=job_id,
                 job_id=job_id,
                 receive_count=receive_count,
                 status="PROCESSING",
@@ -617,6 +633,7 @@ def main() -> None:
 
                 log_event(
                     "job_download_started",
+    trace_id=job_id,
                     job_id=job_id,
                     bucket=bucket,
                     input_key=input_key,
@@ -625,6 +642,7 @@ def main() -> None:
                 s3.download_file(bucket, input_key, str(local_in))
                 log_event(
                     "job_download_finished",
+    trace_id=job_id,
                     job_id=job_id,
                     bucket=bucket,
                     input_key=input_key,
@@ -634,6 +652,7 @@ def main() -> None:
 
                 log_event(
                     "job_processing_started",
+                    trace_id=job_id,
                     job_id=job_id,
                     receive_count=receive_count,
                 )
@@ -661,6 +680,7 @@ def main() -> None:
 
                 log_event(
                     "job_upload_started",
+    trace_id=job_id,
                     job_id=job_id,
                     bucket=bucket,
                     result_key=result_key,
@@ -695,6 +715,7 @@ def main() -> None:
                 sqs.delete_message(QueueUrl=SQS_URL, ReceiptHandle=receipt)
                 log_event(
                     "job_deleted_from_queue",
+                    trace_id=job_id,
                     job_id=job_id,
                     receive_count=receive_count,
                     reason="job_done",
@@ -702,6 +723,7 @@ def main() -> None:
 
                 log_event(
                     "job_processing_completed",
+                    trace_id=job_id,
                     job_id=job_id,
                     receive_count=receive_count,
                     status="DONE",
@@ -721,6 +743,7 @@ def main() -> None:
                 if is_permanent_error(e) and not is_transient_error(e):
                     log_event(
                         "job_failed",
+                        trace_id=job_id,
                         job_id=job_id,
                         receive_count=receive_count,
                         error_code="PermanentError",
@@ -746,6 +769,7 @@ def main() -> None:
                     except Exception as update_err:
                         log_event(
                             "ddb_mark_failed_error",
+    trace_id=job_id,
                             job_id=job_id,
                             receive_count=receive_count,
                             error_type=type(update_err).__name__,
@@ -755,6 +779,7 @@ def main() -> None:
                     sqs.delete_message(QueueUrl=SQS_URL, ReceiptHandle=receipt)
                     log_event(
                         "job_deleted_from_queue",
+    trace_id=job_id,
                         job_id=job_id,
                         receive_count=receive_count,
                         reason="permanent_failure",
@@ -763,6 +788,7 @@ def main() -> None:
                 else:
                     log_event(
                         "job_failed",
+                        trace_id=job_id,
                         job_id=job_id,
                         receive_count=receive_count,
                         error_code="TransientError",
@@ -781,6 +807,7 @@ def main() -> None:
                 except Exception as e:
                     log_event(
                         "cleanup_local_input_failed",
+    trace_id=job_id,
                         job_id=job_id,
                         error_type=type(e).__name__,
                         error_message=str(e),
@@ -790,6 +817,7 @@ def main() -> None:
                 except Exception as e:
                     log_event(
                         "cleanup_local_output_failed",
+    trace_id=job_id,
                         job_id=job_id,
                         error_type=type(e).__name__,
                         error_message=str(e),
