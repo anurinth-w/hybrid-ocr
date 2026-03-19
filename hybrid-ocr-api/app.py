@@ -18,7 +18,7 @@ API_KEY = os.getenv("OCR_API_KEY", "")
 S3_BUCKET = os.getenv("OCR_S3_BUCKET")
 SQS_URL = os.getenv("OCR_SQS_URL")
 DDB_TABLE = os.getenv("OCR_DDB_TABLE")
-AWS_REGION = os.getenv("AWS_REGION")
+AWS_REGION = os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or "ap-southeast-1"
 
 CW_NAMESPACE = os.getenv("CW_NAMESPACE", "HybridOCR")
 CW_SERVICE_DIMENSION = os.getenv("CW_SERVICE_DIMENSION", "HybridOCRAPI")
@@ -30,12 +30,21 @@ sqs = session.client("sqs")
 ddb = session.client("dynamodb")
 cw = session.client("cloudwatch")
 
+def log_event(event: str, **fields: Any) -> None:
+    payload = {
+        "event": event,
+        "ts": now_ms(),
+        "service": "api",
+        "trace_id": fields.get("trace_id"),
+        "job_id": fields.get("job_id"),
+        **fields,
+    }
+    print(json.dumps(payload, ensure_ascii=False), flush=True)
 
 def now_ms() -> int:
     return int(time.time() * 1000)
 
 
-def log_event(event: str, **fields: Any) -> None:
     payload = {
         "event": event,
         "ts": now_ms(),
@@ -123,6 +132,7 @@ def create_job():
 
     log_event(
         "job_create_requested",
+        trace_id=job_id,
         job_id=job_id,
         filename=filename,
         content_type=f.mimetype,
@@ -136,6 +146,7 @@ def create_job():
         put_metric("JobCreateFailures", 1)
         log_event(
             "job_create_failed",
+            trace_id=job_id,
             job_id=job_id,
             status="FAILED",
             error_type="S3UploadFailed",
@@ -168,6 +179,7 @@ def create_job():
         put_metric("JobCreateFailures", 1)
         log_event(
             "job_create_failed",
+            trace_id=job_id,
             job_id=job_id,
             status="FAILED",
             error_type="DDBPutFailed",
@@ -202,6 +214,7 @@ def create_job():
         put_metric("JobCreateFailures", 1)
         log_event(
             "job_create_failed",
+            trace_id=job_id,
             job_id=job_id,
             status="FAILED",
             error_type="SQSSendFailed",
@@ -212,6 +225,7 @@ def create_job():
     put_metric("JobsCreated", 1)
     log_event(
         "job_created",
+        trace_id=job_id,
         job_id=job_id,
         status="QUEUED",
         input_s3_key=input_key,
