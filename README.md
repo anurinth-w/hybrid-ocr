@@ -1,13 +1,13 @@
-Hybrid OCR Infrastructure
+##Hybrid OCR Infrastructure
 Production-Inspired Asynchronous Processing System (AWS)
 
-==============================================================
+--------------------------------------------------------------
 
-Overview
+## Overview
 
 This project is a production-inspired asynchronous OCR processing system built using AWS S3, SQS, and DynamoDB.
 
-It demonstrates:
+### it demonstrates:
 
 - Decoupled architecture
 - At-least-once delivery handling
@@ -19,11 +19,11 @@ It demonstrates:
 
 --------------------------------------------------------------
 
-Architecture
+## Architecture
 
 ![Architecture](docs/architecture.png)
 
-Architecture Flow
+### Architecture Flow
 
 Client
 |
@@ -42,7 +42,7 @@ Worker (poll SQS)
 |-- Update job (DONE / FAILED) -> DynamoDB
 |-- Delete message -> SQS
 
-Design principles:
+### Design principles:
 
 - DynamoDB is the source of truth
 - S3 stores input and result files
@@ -82,21 +82,18 @@ No AWS access keys are stored in GitHub secrets.
 
 --------------------------------------------------------------
 
-Tech Stack
+## Tech Stack
 
 - Python 3.11
 - Flask
 - Gunicorn
 - boto3
-- AWS S3
-- AWS SQS
-- AWS DynamoDB
-- Docker
-- Docker Compose
+- AWS S3 / SQS / DynamoDB
+- Docker / Docker Compose
 
 --------------------------------------------------------------
 
-Project Structure
+## Project Structure
 
 hybrid-ocr/
 
@@ -121,50 +118,53 @@ hybrid-ocr/
 
 --------------------------------------------------------------
 
-Environment Variables
+## Environment Variables
 
-Create a `.env` file in the project root:
+### Create a `.env` file
 
-OCR_API_KEY=changeme  
-OCR_S3_BUCKET=your-bucket-name  
-OCR_SQS_URL=https://sqs.ap-southeast-1.amazonaws.com/ACCOUNT_ID/queue-name  
-OCR_DDB_TABLE=your-ddb-table  
-AWS_REGION=ap-southeast-1  
+OCR_API_KEY=changeme
+OCR_S3_BUCKET=your-bucket
+OCR_SQS_URL=your-sqs-url
+OCR_DDB_TABLE=your-ddb-table
+AWS_REGION=ap-southeast-1
 
 --------------------------------------------------------------
 
-Running Locally
+## Running Locally
 
-Build and start both services:
+### bash
 
 docker compose up --build
 
-API will be available at:
+### API
 
 http://localhost:8000
 
-Health check:
+### Health check
 
 curl http://localhost:8000/health
 
 --------------------------------------------------------------
 
-API Endpoints
+## API Endpoints
 
-Create Job
+### Create Job
 
 POST /jobs
 
-Header:
+### Header
+
 x-api-key: <OCR_API_KEY>
 
-Content-Type:
+### Content-Type
+
 multipart/form-data
 
-Field:
+### Field
+
 file
 
-Response:
+### Response
 
 {
 "job_id": "...",
@@ -173,70 +173,180 @@ Response:
 
 --------------------------------------------------------------
 
-Get Job Status
+## Get Job Status
 
 GET /jobs/<job_id>
 
-Header:
-x-api-key: <OCR_API_KEY>
-
-Possible states:
+### states
 
 - QUEUED
 - PROCESSING
 - DONE
 - FAILED
 
-If DONE, a presigned S3 download URL is returned.
+If DONE → returns presigned S3 URL
 
 --------------------------------------------------------------
 
-Failure Handling
+## Failure Handling
 
-This system handles:
+### Handles
 
 - At-least-once delivery (SQS Standard)
 - Worker crash before delete_message
-- Crash after result upload but before DynamoDB update
-- Idempotent job execution
+- Crash after upload but before DDB update
+- Duplicate message processing
 
-DynamoDB conditional expressions prevent duplicate state transitions.
+### Mechanism
 
---------------------------------------------------------------
-
-Observability
-
-CloudWatch Dashboard
-
-![Dashboard](docs/dashboard.png)
-
-The system includes basic observability using CloudWatch metrics and dashboards.
-
-Key metrics monitored:
-
-JobsProcessed  
-Number of successfully processed jobs.
-
-JobDuration  
-Processing latency.
-
-JobFailures  
-Number of failed jobs.
-
-QueueDepth  
-Number of messages waiting in the SQS queue.
-
-QueueAge  
-Age of the oldest message in the queue.
-
-DLQMessages  
-Number of messages in the Dead Letter Queue.
-
-These metrics help monitor system health and worker performance.
+- Idempotent worker
+- DynamoDB conditional writes
+- Safe state transitions
 
 --------------------------------------------------------------
 
-CloudWatch Alarms
+## Chaos Testing (Failure Scenarios)
+
+See detailed timeline and results:
+[Chaos Test Report](https://docs.google.com/spreadsheets/d/1HH7SjYduQlUfoU6T7efCPeReIEOZ0tc4gKgFm3OhTz8/edit?usp=sharing)
+
+Tested scenarios:
+
+-Worker crash
+-Transient failure (retry)
+-Permanent failure
+-Dead Letter Queue (DLQ)
+
+Results:
+
+-Transient errors are retried and eventually succeed
+-Permanent errors are marked FAILED (no retry)
+-Messages exceeding retry limit go to DLQ
+-No data loss observed during failures
+
+--------------------------------------------------------------
+
+## Failure Behavior Summary
+
+The system was designed to handle real-world distributed system failures:
+
+- Worker crashes do not result in data loss
+- Messages may be delivered multiple times (SQS Standard)
+- Idempotent processing ensures safe re-execution
+- Transient failures are retried automatically
+- Permanent failures are not retried
+- Poison messages are isolated via DLQ
+
+--------------------------------------------------------------
+
+## Observability
+
+### CloudWatch Dashboard
+
+This dashboard was used during chaos testing to observe system behavior under failure scenarios.
+
+It shows queue backlog growth, retry patterns, and DLQ behavior.
+
+![Dashboard](docs/dashboard2.png)
+
+- Queue depth increases when worker is unavailable
+- DLQ messages appear after retry exhaustion
+- Job failures split into transient vs permanent
+
+## Metrics (CloudWatch)
+
+The system exposes custom metrics to monitor job processing, system health, and queue behavior.
+
+### Job Metrics
+
+- JobsCreated  
+  Total number of jobs submitted to the system.
+
+- JobsProcessed  
+  Number of successfully completed jobs.
+
+- JobFailures  
+  Total number of failed jobs.
+
+- JobsFailedTransient  
+  Number of transient failures (retried automatically).
+
+- JobsFailedPermanent  
+  Number of permanent failures (not retried).
+
+---
+
+### Latency Metrics
+
+- QueueDelayMs  
+  Time spent in queue before a worker starts processing the job.
+
+- ProcessingLatencyMs  
+  Time taken by the worker to process the job.
+
+- EndToEndLatencyMs  
+  Total time from job creation to completion.
+
+---
+
+### Queue Metrics (SQS)
+
+- QueueDepth  
+  Approximate number of messages waiting in the queue  
+  (ApproximateNumberOfMessagesVisible)
+
+- QueueAge  
+  Age of the oldest message in the queue  
+  (ApproximateAgeOfOldestMessage)
+
+- DLQMessages  
+  Number of messages in the Dead Letter Queue
+
+---
+
+### Worker Metrics
+
+- WorkerHeartbeat  
+  Indicates worker liveness (emitted periodically)
+
+- CPUUsagePercent  
+  CPU usage of the worker instance/container
+
+- MemoryUsagePercent  
+  Memory usage of the worker
+
+- GPUUsagePercent (optional)  
+  GPU utilization (if GPU is enabled)
+
+---
+
+### Failure & Retry Behavior
+
+- ReceiveCount  
+  Number of times a message has been received from SQS
+
+- RetryCount  
+  Number of retries before success or failure
+
+- TimeToRecoveryMs  
+  Time from first failure to successful completion
+
+- TimeToDLQMs  
+  Time taken for a message to move to DLQ after repeated failures
+
+---
+
+### Why These Metrics Matter
+
+- Detect backlog growth (QueueDepth, QueueAge)
+- Identify slow processing (Latency metrics)
+- Monitor system reliability (Failures, DLQ)
+- Ensure worker health (Heartbeat, CPU/Memory)
+- Validate retry behavior (RetryCount, ReceiveCount)
+
+--------------------------------------------------------------
+
+## CloudWatch Alarms
 
 ![Alarms](docs/alarms.png)
 
@@ -258,7 +368,7 @@ These alarms help detect operational issues early.
 
 --------------------------------------------------------------
 
-Runbook
+## Runbook
 
 Operational checks for common issues.
 
@@ -298,7 +408,7 @@ Permanent failures should set job status to FAILED.
 
 --------------------------------------------------------------
 
-If messages appear in DLQ
+### If messages appear in DLQ
 
 Check the DLQ queue.
 
@@ -311,32 +421,30 @@ Steps:
 
 --------------------------------------------------------------
 
-Engineering Concepts Demonstrated
+## Engineering Concepts Demonstrated
 
-- Asynchronous processing
-- Decoupled architecture
-- Message-driven systems
-- Visibility timeout awareness
-- Idempotent design
-- Production-style containerization
-- Observability with metrics and alarms
-
---------------------------------------------------------------
-
-Future Improvements
-
-- Terraform (Infrastructure as Code)
-- CI/CD pipeline (GitHub Actions)
-- Structured logging
-- Retry state handling
-- Dead-letter queue automation
-- Metrics and monitoring improvements
+- Async processing
+- Message-driven architecture
+- Idempotency
+- Failure handling (retry + DLQ)
+- Visibility timeout behavior
+- Observability (metrics + alarms)
 
 --------------------------------------------------------------
 
-Author
+## What This Project Demonstrates
 
-Anurinth Wichairum
+This project demonstrates the ability to design and operate a production-style asynchronous system with:
+
+- Failure handling
+- Retry logic
+- Observability
+- Cloud-native architecture
+
+--------------------------------------------------------------
+
+## Author
+
+### Anurinth Wichairum
 
 Cloud / DevOps Engineer (Aspiring)
-
